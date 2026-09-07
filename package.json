@@ -6,19 +6,40 @@
     "url": "git+https://github.com/better-er/dsh-pause.git"
   },
   "description": "DSH Web 暂停插件：agent 完成一轮工具交互、正要发出下一次模型请求之前暂停，保持 composer 输入框可用，人类以回车/发送放行并可携带补充文字；此暂停不打断任何在途 API 调用，模型上下文始终完整、无感知。纯插件自包含，不改 DSH 源码。",
-  "keywords": ["deepseek-harness","dsh","dsh-plugin","pause","gate","steer","tool-round"],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "pause",
+    "gate",
+    "steer",
+    "tool-round"
+  ],
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "exports": {
-    ".": { "types": "./lib/index.d.ts", "default": "./lib/index.js" },
-    "./client": { "default": "./lib/client.js" },
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
-    "client": { "platform": "web", "inject": ["@deepseek-ai/dsh-client-runtime","@deepseek-ai/dsh-client-ui-conversation"] }
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
   },
   "scripts": {
     "build": "tsc -b && tsdown",
@@ -26,8 +47,13 @@
     "typecheck": "tsc -b --pretty false",
     "test": "vitest run"
   },
-  "peerDependencies": { "@deepseek-ai/cordis": ">=4.0.0", "react": "^18.2.0" },
-  "dependencies": { "@deepseek-ai/schemastery": ">=3.18.0" },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.0",
+    "react": "^18.2.0"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": ">=3.18.0"
+  },
   "devDependencies": {
     "@deepseek-ai/cordis": ">=4.0.0",
     "@deepseek-ai/dsh-client-connection": "0.1.2-rc.1",
@@ -45,6 +71,12 @@
     "vite-tsconfig-paths": "^6.1.1",
     "vitest": "^4.1.1"
   },
-  "files": ["lib/index.js","lib/client.js","lib/index.d.ts","cordis.patch.yml","README.md"],
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "lib/index.d.ts",
+    "cordis.patch.yml",
+    "README.md"
+  ],
   "license": "MIT"
 }
