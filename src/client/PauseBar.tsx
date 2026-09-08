@@ -11,6 +11,7 @@
  * @module dsh-pause/client
  */
 import { memo, useEffect, useRef, useState } from 'react'
+import type { ReactElement } from 'react'
 import type { SnapshotSelectorHook } from '@deepseek-ai/dsh-client-ui-slots'
 import type { InputActions, InputState } from '@deepseek-ai/dsh-client-ui-conversation/client'
 
@@ -79,6 +80,18 @@ async function releaseAndClear(
     if (draft !== '' && inputActions !== undefined) inputActions.setDraft('')
     onDone()
   }
+}
+
+/**
+ * 暂停图标：两条竖线，单色 currentColor 跟随主题。
+ */
+function PauseIcon(): ReactElement {
+  return (
+    <svg viewBox="0 0 16 16" width={12} height={12} fill="currentColor" aria-hidden="true" style={{ flex: 'none' }}>
+      <rect x={3.6} y={2.4} width={3.4} height={11.2} rx={1.2} />
+      <rect x={9} y={2.4} width={3.4} height={11.2} rx={1.2} />
+    </svg>
+  )
 }
 
 /**
@@ -173,8 +186,12 @@ export const PauseControl = memo(function PauseControl({
           padding: '1px 8px',
           fontSize: '12px',
           lineHeight: '18px',
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: '4px',
         }}
       >
+        <PauseIcon />
         {enabled ? '暂停开' : '暂停'}
       </button>
       {paused && (
