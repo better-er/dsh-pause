@@ -83,6 +83,7 @@ dsh 把一次模型请求当作一个 step，agent 连续调用工具时会经�
 - 续跑判定用同一 turn 内 step 大于 1 近似，首条纯文字请求永不暂停。
 - 浏览器端经 `conversation.input.right` 槽位在 composer 工具行渲染控件。
 - 因 dsh 的 composer Enter 由 InputBar 私有 keymap 处理、第三方无 hook 点，暂停态用 DOM capture 拦截裸 Enter 改走放行，不改 DSH 源码。
+- 主机侧不经 `ctx.connection.rpc.handle`：该 API 自 0.1.2 起即不可用，改为向 webServer 自注册 `/dsh-pause` 前缀路由，复用 connection 的信任判定与浏览器鉴权，信封格式与官方一致。
 
 ## 开发
 

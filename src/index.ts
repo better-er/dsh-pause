@@ -1,7 +1,5 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import '@deepseek-ai/dsh-client-connection'
-import { transportError } from '@deepseek-ai/dsh-client-connection'
 import type { ConnectionRpcHandler, ConnectionRpcResult } from '@deepseek-ai/dsh-client-connection'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { DEFAULT_ENABLED, PauseRegistry, textToMessages } from './controller.ts'
@@ -72,7 +70,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       return rpcError(error instanceof Error ? error.message : String(error))
     }
   }
-  // dsh 0.1.5 的 connection.rpc.handle 在登记路由时解析 webServer 会抛 without inject，改为插件自注册通道。
+  // connection.rpc.handle 自 0.1.2-rc.1 起即不可用，登记路由时解析 webServer 会抛 without inject，故改为插件自注册通道。
   mountRpcChannel(ctx, '/dsh-pause', handler)
 
   ctx.on('agent/pre-step', async (payload: PreStepPayload, next: () => Promise<PreStepDecision>) => {

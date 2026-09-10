@@ -1,10 +1,24 @@
 /**
  * 在 webServer 上自注册一条 connection 风格的 RPC 通道。
  *
- * dsh 0.1.5 的 connection.rpc.handle 会在登记路由时解析 webServer，实测任何插件上下文都抛
- * `cannot get property "webServer" without inject`，官方自身也从不走该路径。
- * 因此这里直接向 webServer 注册 prefix 路由，复用 connection.requestRejection 的
- * Host 校验与浏览器鉴权，并实现同样的 client-request/server-response 信封。
+ * dsh 的 connection.rpc.handle 登记路由时会在 connection 服务自身上下文解析 webServer，
+ * 而该上下文的 inject 只有 credentials，于是任何插件调用都抛
+ * cannot get property "webServer" without inject。对照 0.1.2-rc.1 与 0.1.5-rc.2，get rpc
+ * 与 register 逐字相同、owner.webServer 行为一致，所以这不是 0.1.5 引入的回归，该 API
+ * 自 0.1.2 起即不可用；官方发行包内 handle 也没有调用点，/api 走 ctx.inject(['webServer'])
+ * 直接调 webServer.register。
+ *
+ * 自注册并非唯一出路。私有 register(owner, channel, handler) 显式接收 owner，不解析 this.ctx，
+ * 在注入了 webServer 的作用域里可用，能完整复用官方 transport。代价是它标了 private，需要
+ * 类型断言，且上游可能改名或移除。故这里选择自行实现同样的信封语义。
+ *
+ * 与官方 transport 的有意差异：
+ * - 请求体上限 8 MiB；本插件载荷只有 sessionId 与短文字，远小于官方按 maxRequestBodyBytes 的默认 300 MiB。
+ * - 信封校验手写，只认 type/method/rpcId，不用 clientRequestSchema 校验 payload 与 rpcId 形状。
+ * - handler 抛错时回 200 信封、code 为 internal，而非官方 500 纯文本；本通道 handler 自带 try，实际不可达。
+ *
+ * 本文件与 better-er/dsh-classic-coding 的 src/rpc-channel.ts 同源，dsh-live-token-stats 内也有副本；
+ * 改动鉴权、端点解析或信封语义时，三处需同步。
  *
  * @module dsh-pause/rpc-channel
  */
@@ -51,8 +65,13 @@ interface Scope {
 
 /** 端点路径段的合法字符集，与官方 ENDPOINT_SEGMENT_PATTERN 一致。 */
 const SEGMENT = /^[A-Za-z0-9_$.-]+$/
-/** 请求体上限，RPC 信封远小于此值。 */
+/** 请求体上限。本插件载荷极小，8 MiB 已远超实际，故不采用官方 300 MiB。 */
 const MAX_BODY_BYTES = 8 * 1024 * 1024
+/** 唯一接受的 content-type，与官方信封契约一致。 */
+const JSON_MIME = 'application/json'
+
+/** 请求体超限的标记错误，由 serve 决定如何回写与断开。 */
+class PayloadTooLargeError extends Error {}
 
 /**
  * 挂载一条 RPC 通道。webServer 或 connection 缺席时不挂载，其余功能不受影响。
@@ -102,12 +121,22 @@ async function serve(
   const endpoint = pathname.slice(prefix.length)
   if (!endpoint.split('/').every((part) => part !== '' && part !== '.' && part !== '..' && SEGMENT.test(part))) return missing(res)
 
+  if (!isJsonContentType(req)) {
+    res.writeHead(415)
+    res.end('unsupported media type')
+    return
+  }
+  // 声明了超限 content-length 时先快速拒绝，不必把整份超限请求读完。
+  const declared = Number(req.headers['content-length'])
+  if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) return tooLarge(req, res)
+
   let raw: string
   try {
     raw = await readBody(req)
   } catch (error) {
-    res.writeHead(413)
-    res.end('payload too large')
+    if (error instanceof PayloadTooLargeError) return tooLarge(req, res)
+    res.writeHead(400)
+    res.end('body read failed')
     return
   }
   let message: { type?: unknown; rpcId?: unknown; method?: unknown; payload?: unknown }
@@ -128,11 +157,17 @@ async function serve(
       error: { code: 'gateway/bad-request', message: `method ${JSON.stringify(message.method)} does not match endpoint ${JSON.stringify(endpoint)}`, details: {} },
     })
   }
+  // 客户端断开即取消，等价官方 bridge 传 request.signal 的语义。
+  const controller = new AbortController()
+  const onClose = (): void => { controller.abort(new Error('client disconnected')) }
+  res.on('close', onClose)
   let result: RpcChannelResult
   try {
-    result = await handler(endpoint, message.payload, new AbortController().signal)
+    result = await handler(endpoint, message.payload, controller.signal)
   } catch (error) {
     result = { ok: false, error: { code: 'internal', message: error instanceof Error ? error.message : String(error), details: {} } }
+  } finally {
+    res.off('close', onClose)
   }
   reply(res, rpcId, result)
 }
@@ -149,17 +184,29 @@ function reply(res: ServerResponse, rpcId: string, result: RpcChannelResult): vo
   res.end(JSON.stringify({ type: 'server-response', rpcId, result }))
 }
 
-/** 读取并限长请求体。 */
+/** 先回 413 再销毁连接：顺序反了 socket 已断，413 永远发不出去。 */
+function tooLarge(req: IncomingMessage, res: ServerResponse): void {
+  res.writeHead(413, { connection: 'close' })
+  res.end('payload too large')
+  req.destroy()
+}
+
+/** content-type 必须声明为 application/json，charset 等参数可忽略。 */
+function isJsonContentType(req: IncomingMessage): boolean {
+  const header = req.headers['content-type']
+  if (typeof header !== 'string') return false
+  const mime = header.split(';', 1)[0]
+  return mime !== undefined && mime.trim().toLowerCase() === JSON_MIME
+}
+
+/** 读取并限长请求体，超限抛 PayloadTooLargeError，由调用方回写 413。 */
 async function readBody(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = []
   let size = 0
   for await (const chunk of req) {
     const buffer = typeof chunk === 'string' ? Buffer.from(chunk) : chunk as Buffer
     size += buffer.length
-    if (size > MAX_BODY_BYTES) {
-      req.destroy()
-      throw new Error('rpc channel: request body exceeds limit')
-    }
+    if (size > MAX_BODY_BYTES) throw new PayloadTooLargeError('rpc channel: request body exceeds limit')
     chunks.push(buffer)
   }
   return Buffer.concat(chunks).toString('utf8')
