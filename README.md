@@ -2,9 +2,17 @@
 
 ## 引言
 
-DeepSeek Harness 自动调用工具并连续作答，虽然有插话发送但是 DeepSeek 输出太快了，拼尽全力也没有其百分之一的 tok/s，根本无法成功插话。而直接打断 DeepSeek 的输出会导致其变得胆小，甚至不再调用工具，感觉就差哭出来了。
+DeepSeek Harness 会自动调用工具并连续作答，虽然可以使用插话发送在中途提示，但是 DeepSeek 输出太快了，拼尽全力也没有其百分之一的 tok/s，根本无法成功插话。而直接打断 DeepSeek 的输出会导致其变成胆小菇，甚至不愿继续执行命令，工作积极性大幅下降。
 
-此插件使用了拔网线的力量，直接阻止 DeepSeek 发出下一次请求，直到你按下 Enter 或点按钮放行。暂停期间 composer 输入框照常可打字并插话发送后自动继续，或者直接回车让模型无感继续。
+为了能够成功在 DeepSeek 下一轮调用前插话并保护其弱小的心灵，此插件使用了拔网线的力量，假装卡了阻止 DeepSeek 发出下一次请求，直到你按下 Enter 或点按钮放行。暂停期间输入框照常可打字并插话发送后自动继续，或者直接回车让模型继续，这样在模型侧不会察觉到暂停的存在。
+
+恰巧做完这个插件后，`deepseek-v4.1-flash-expires-on-0910` 速度已经到 300~400 tok/s，这下拼尽全力也追不上其百分之一的 tok/s，只能使用盘外招了。
+
+注：现 deepseek-v4-flash 的速度约为 100 tok/s，而其一个中文字符约为 0.6 token，其百分之一的速度为 100 字/分钟，你的打字速度如何？
+
+## 关键词
+
+暂停 · 插话 · 无感
 
 ## 功能
 
@@ -75,6 +83,7 @@ dsh 把一次模型请求当作一个 step，agent 连续调用工具时会经�
 - 续跑判定用同一 turn 内 step 大于 1 近似，首条纯文字请求永不暂停。
 - 浏览器端经 `conversation.input.right` 槽位在 composer 工具行渲染控件。
 - 因 dsh 的 composer Enter 由 InputBar 私有 keymap 处理、第三方无 hook 点，暂停态用 DOM capture 拦截裸 Enter 改走放行，不改 DSH 源码。
+- 主机侧不经 `ctx.connection.rpc.handle`：该 API 自 0.1.2 起即不可用，改为向 webServer 自注册 `/dsh-pause` 前缀路由，复用 connection 的信任判定与浏览器鉴权，信封格式与官方一致。
 
 ## 开发
 
