@@ -3,36 +3,59 @@
  * 用桩 ctx 捕获 agent/pre-step 监听与 RPC 处理器。
  * 驱动「暂停 → RPC release 放行 → next() 放行该步」与「带文字放行并入 user 消息」两条路径。
  */
-import { describe, expect, it } from 'vitest'
+import http from 'node:http'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { apply } from '../src/index.ts'
 
 type PreStepListener = (payload: any, next: () => Promise<any>) => Promise<any>
-type RpcHandler = (endpoint: string, payload: unknown) => Promise<any>
+type RouteHandler = (req: http.IncomingMessage, res: http.ServerResponse) => void | Promise<void>
 
-/** 造一个桩 ctx：捕获 apply 注册的 pre-step 监听与 RPC handler。 */
+/** apply 自注册的路由处理器，由最近一次 harness 捕获。 */
+let routeHandler: RouteHandler | undefined
+
+const server = http.createServer((req, res) => { void routeHandler?.(req, res) })
+let port = 0
+
+beforeAll(async () => {
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  port = (server.address() as { port: number }).port
+})
+
+afterAll(() => { server.close() })
+
+/** 打一次本通道 RPC，返回信封里的 result。 */
+async function rpc(method: string, payload: unknown): Promise<any> {
+  const response = await fetch(`http://127.0.0.1:${port}/dsh-pause/${method}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'client-request', rpcId: 'test', method, payload }),
+  })
+  const body = await response.json() as { result: any }
+  return body.result
+}
+
+/** 造一个桩 ctx：捕获 apply 注册的 pre-step 监听，并接住自注册的 prefix 路由。 */
 function harness(enabledDefault = false) {
   let preStepListener: PreStepListener | undefined
-  let rpcHandler: RpcHandler | undefined
-  const effects: Array<() => unknown> = []
+  const scope = {
+    connection: { requestRejection: () => undefined },
+    webServer: {
+      register(route: { handler: RouteHandler }) {
+        routeHandler = route.handler
+        return () => {}
+      },
+    },
+    effect(cb: () => unknown) { return cb() },
+  }
   const ctx = {
     on(_name: string, listener: any) {
       if (_name === 'agent/pre-step') preStepListener = listener as PreStepListener
       return () => true
     },
-    effect(fn: () => unknown) { effects.push(fn) },
-    connection: {
-      rpc: {
-        handle(_ch: string, h: any) { rpcHandler = h as RpcHandler; return () => Promise.resolve() },
-      },
-    },
+    inject(_deps: string[], cb: (s: unknown) => void) { cb(scope) },
   }
   apply(ctx as any, { defaultEnabled: enabledDefault })
-  // 物化 effect 以真正调用 rpc.handle
-  for (const fn of effects) void fn()
-  return {
-    get preStep() { return preStepListener! },
-    get rpc() { return rpcHandler! },
-  }
+  return { get preStep() { return preStepListener! } }
 }
 
 describe('apply host wiring', () => {
@@ -70,10 +93,10 @@ describe('apply host wiring', () => {
     await Promise.resolve()
     expect(nextCalledAfter).toBe(false)
     // RPC status 应报 paused
-    const statusBefore = await h.rpc('status', { sessionId: 's1' })
+    const statusBefore = await rpc('status', { sessionId: 's1' })
     expect(statusBefore.value.paused).toBe(true)
     // RPC release 空文字
-    const rel = await h.rpc('release', { sessionId: 's1', text: '' })
+    const rel = await rpc('release', { sessionId: 's1', text: '' })
     expect(rel.value.released).toBe(true)
     const decision = await p
     expect(nextCalledAfter).toBe(true)
@@ -88,7 +111,7 @@ describe('apply host wiring', () => {
       async () => base,
     )
     await Promise.resolve()
-    await h.rpc('release', { sessionId: 's2', text: ' 先别跑，我再想想  ' })
+    await rpc('release', { sessionId: 's2', text: ' 先别跑，我再想想  ' })
     const decision = await p
     expect(decision.kind).toBe('enter')
     expect(decision.messages).toHaveLength(1)
@@ -96,14 +119,14 @@ describe('apply host wiring', () => {
   })
 
   it('无门时 release 返回 released:false', async () => {
-    const h = harness(true)
-    const rel = await h.rpc('release', { sessionId: 'nobody', text: '' })
+    harness(true)
+    const rel = await rpc('release', { sessionId: 'nobody', text: '' })
     expect(rel.value.released).toBe(false)
   })
 
   it('RPC 参数校验返回 error', async () => {
-    const h = harness(true)
-    const bad = await h.rpc('release', { text: 'x' })
+    harness(true)
+    const bad = await rpc('release', { text: 'x' })
     expect(bad.ok).toBe(false)
   })
 
@@ -115,12 +138,18 @@ describe('apply host wiring', () => {
       async () => base,
     )
     await Promise.resolve()
-    const before = await h.rpc('status', { sessionId: 's3' })
+    const before = await rpc('status', { sessionId: 's3' })
     expect(before.value.paused).toBe(true)
     // 关闭开关：应放行门并让 pre-step 走完
-    const off = await h.rpc('setEnabled', { sessionId: 's3', enabled: false })
+    const off = await rpc('setEnabled', { sessionId: 's3', enabled: false })
     expect(off.value.paused).toBe(false)
     const decision = await p
     expect(decision).toEqual(base)
+  })
+
+  it('空端点返回 404', async () => {
+    harness(true)
+    const response = await fetch(`http://127.0.0.1:${port}/dsh-pause/`)
+    expect(response.status).toBe(404)
   })
 })
