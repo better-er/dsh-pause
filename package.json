@@ -1,11 +1,15 @@
 {
   "name": "dsh-pause",
-  "version": "0.1.1",
+  "version": "0.1.2",
+  "packageManager": "pnpm@9.15.9",
+  "engines": {
+    "node": ">=26.3.1"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/better-er/dsh-pause.git"
   },
-  "description": "DSH Web 暂停插件：agent 完成一轮工具交互、正要发出下一次模型请求之前暂停，保持 composer 输入框可用，人类以回车/发送放行并可携带补充文字；此暂停不打断任何在途 API 调用，模型上下文始终完整、无感知。纯插件自包含，不改 DSH 源码。",
+  "description": "「DSH·暂停」：agent 完成一轮工具交互、正要发出下一次模型请求之前暂停，保持 composer 输入框可用，人类以回车/发送放行并可携带补充文字；此暂停不打断任何在途 API 调用，模型上下文始终完整、无感知。纯插件自包含，不改 DSH 源码。",
   "keywords": [
     "deepseek-harness",
     "dsh",
@@ -49,6 +53,7 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.0",
+    "@deepseek-ai/dsh": "^0.1.7-rc.2",
     "react": "^18.2.0"
   },
   "dependencies": {

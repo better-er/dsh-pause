@@ -1,8 +1,7 @@
-﻿name: Release
+name: Release
 
-# 推送形如 vX.Y.Z 如 v0.3.0 的 tag 时自动发版：
-#   凭 tag 号更新 package.json 版本并提交回 main → 测试 → 构建 → 发布 npm
-#   → 生成 GitHub Release draft。人只需打一个 tag，其余自动衔接。
+# 推送形如 vX.Y.Z 如 v0.1.0 的 tag 时自动发版：先把 package.json 版本兜底对齐到 tag 号，不一致才提交回 main → 类型检查 → 构建 → 发布 npm → 生成 GitHub Release draft。
+# 人只需打一个 tag，其余自动衔接。
 # 注意：npm 发布走 Trusted Publishing，无需 NPM_TOKEN；未在 npm 侧绑定信任关系时发布会失败。
 on:
   push:
@@ -36,8 +35,8 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       # 前置守卫：仅当该 tag 版本尚未发布到 npm 时才继续发版。
-      # 补历史 tag 时对应版本早已在 npm 上，重复 publish 会报错，且版本回写会把 main 改回旧号；
-      # 故已发布则跳过后续所有步骤。npm view 只读 registry，无需凭证。
+      # 补历史 tag 时对应版本早已在 npm 上，重复 publish 会报错，且版本回写会把 main 改回旧号，故已发布则跳过后续所有步骤。
+      # npm view 只读 registry，无需凭证。
       - name: Skip when tag version already published
         id: published
         run: |
@@ -52,12 +51,13 @@ jobs:
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # 版本号仅凭 tag 号决定，写入 package.json 并提交回 main。
+      # 版本号以源码里的 package.json 为准，正常随改动一起提交，发版前与将要打的 tag 对齐。
+      # 这一步只是兜底：忘改或写错时在此对齐 tag 号，再提交回 main。
       - name: Sync version to main
         if: steps.published.outputs.published != 'true'
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME#v}"          # 去 v 前缀得版本号，如 0.3.0
+          TAG="${GITHUB_REF_NAME#v}"          # 去 v 前缀得版本号，如 0.1.0
           echo "target version = $TAG"
 
           # 切到 main 分支再改版本，避免在 detached tag 上提交。
@@ -73,7 +73,7 @@ jobs:
             fs.writeFileSync('./package.json', JSON.stringify(p, null, 2) + '\n');
           " "$TAG"
 
-          # 已是最新版本则无改动，跳过提交；否则提交并推回 main。
+          # 兜底对齐后与 package.json 已一致则无改动，跳过提交；否则提交并推回 main。
           git diff --quiet package.json || {
             git add package.json
             git commit -m "chore: release $TAG 同步 package.json 版本 [skip ci]"
@@ -84,21 +84,25 @@ jobs:
         if: steps.published.outputs.published != 'true'
         uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 9.15.9
 
       # setup-node 的 registry-url 告知 npm 向哪个 registry 换 Trusted Publishing 临时凭证。
-      # node-version 必须大于等于 24，捆绑的 npm 才大于等于 11.5.1，这是 npm 官方 Trusted Publishing 硬性要求；低于该版本 npm CLI 无法做 OIDC 自动换权，会回退用失效 token 导致 PUT 404 is not in registry。
+      # node-version 与本地 node -v 锁死同一版本。它同时满足 npm 官方 Trusted Publishing 的下限：捆绑 npm 需大于等于 11.5.1，否则 npm CLI 无法做 OIDC 自动换权，会回退用失效 token 导致 PUT 404 is not in registry。
       - name: Setup Node
         if: steps.published.outputs.published != 'true'
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 26.3.1
           cache: pnpm
           registry-url: https://registry.npmjs.org
 
       - name: Install dependencies
         if: steps.published.outputs.published != 'true'
         run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        if: steps.published.outputs.published != 'true'
+        run: pnpm typecheck
 
       - name: Test
         if: steps.published.outputs.published != 'true'
@@ -108,8 +112,17 @@ jobs:
         if: steps.published.outputs.published != 'true'
         run: pnpm build
 
+      # 本插件是双半身且产出 dts，产物缺失会在此失败。
+      - name: Verify build outputs
+        if: steps.published.outputs.published != 'true'
+        run: |
+          test -f lib/index.js
+          test -f lib/client.js
+          test -f lib/index.d.ts
+          test -f cordis.patch.yml
+          echo "构建产物齐全：lib/index.js · lib/client.js · lib/index.d.ts · cordis.patch.yml"
+
       # Trusted Publishing：npm 凭 workflow 的 OIDC 身份直接授权，无需 NPM_TOKEN；--provenance 会在 npm 上附构建来源证明。
-      # node-version 24 保证捆绑 npm>=11.5.1，npm CLI 才能做 OIDC 自动换权发布。
       - name: Publish to npm
         if: steps.published.outputs.published != 'true'
         run: npm publish --provenance --access public
