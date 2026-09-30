@@ -1,9 +1,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import type { ConnectionRpcHandler, ConnectionRpcResult } from '@deepseek-ai/dsh-client-connection'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { DEFAULT_ENABLED, PauseRegistry, textToMessages } from './controller.ts'
-import { mountRpcChannel } from './rpc-channel.ts'
+import { mountRpcChannel, type RpcChannelHandler, type RpcChannelResult } from './rpc-channel.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Events {
@@ -32,8 +31,8 @@ interface ReleaseBody { sessionId?: unknown; text?: unknown }
 interface EnableBody { sessionId?: unknown; enabled?: unknown }
 interface StatusBody { sessionId?: unknown }
 
-function ok(value: unknown): ConnectionRpcResult<unknown> { return { ok: true, value } }
-function rpcError(message: string): ConnectionRpcResult<unknown> {
+function ok(value: unknown): RpcChannelResult { return { ok: true, value } }
+function rpcError(message: string): RpcChannelResult {
   return { ok: false, error: { code: 'internal', message, details: {} } }
 }
 
@@ -41,7 +40,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   const defaultEnabled = config.defaultEnabled === true
   const registry = new PauseRegistry(defaultEnabled)
 
-  const handler: ConnectionRpcHandler = async (endpoint, payload) => {
+  const handler: RpcChannelHandler = async (endpoint, payload) => {
     try {
       switch (endpoint) {
         case 'setEnabled': {
