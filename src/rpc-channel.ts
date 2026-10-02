@@ -1,24 +1,16 @@
 /**
  * 在 webServer 上自注册一条 connection 风格的 RPC 通道。
  *
- * dsh 的 connection.rpc.handle 登记路由时会在 connection 服务自身上下文解析 webServer，
- * 而该上下文的 inject 只有 credentials，于是任何插件调用都抛
- * cannot get property "webServer" without inject。对照 0.1.2-rc.1 与 0.1.5-rc.2，get rpc
- * 与 register 逐字相同、owner.webServer 行为一致，所以这不是 0.1.5 引入的回归，该 API
- * 自 0.1.2 起即不可用；官方发行包内 handle 也没有调用点，/api 走 ctx.inject(['webServer'])
- * 直接调 webServer.register。
+ * dsh 的 connection.rpc.handle 登记路由时会在 connection 服务自身上下文解析 webServer，而该上下文的 inject 只有 credentials，于是任何插件调用都抛 cannot get property "webServer" without inject。对照 0.1.2-rc.1 与 0.1.5-rc.2，get rpc 与 register 逐字相同、owner.webServer 行为一致，所以这不是 0.1.5 引入的回归，该 API 自 0.1.2 起即不可用；官方发行包内 handle 也没有调用点，/api 走 ctx.inject(['webServer']) 直接调 webServer.register。
  *
- * 自注册并非唯一出路。私有 register(owner, channel, handler) 显式接收 owner，不解析 this.ctx，
- * 在注入了 webServer 的作用域里可用，能完整复用官方 transport。代价是它标了 private，需要
- * 类型断言，且上游可能改名或移除。故这里选择自行实现同样的信封语义。
+ * 自注册并非唯一出路。私有 register(owner, channel, handler) 显式接收 owner，不解析 this.ctx，在注入了 webServer 的作用域里可用，能完整复用官方 transport。代价是它标了 private，需要类型断言，且上游可能改名或移除。故这里选择自行实现同样的信封语义。
  *
  * 与官方 transport 的有意差异：
  * - 请求体上限 8 MiB；本插件载荷只有 sessionId 与短文字，远小于官方按 maxRequestBodyBytes 的默认 300 MiB。
  * - 信封校验手写，只认 type/method/rpcId，不用 clientRequestSchema 校验 payload 与 rpcId 形状。
  * - handler 抛错时回 200 信封、code 为 internal，而非官方 500 纯文本；本通道 handler 自带 try，实际不可达。
  *
- * 本文件与 better-er/dsh-classic-coding 的 src/rpc-channel.ts 同源，dsh-live-token-stats 内也有副本；
- * 改动鉴权、端点解析或信封语义时，三处需同步。
+ * 本文件与 better-er/dsh-classic-coding 的 src/rpc-channel.ts 同源，dsh-live-token-stats 内也有副本；改动鉴权、端点解析或信封语义时，三处需同步。
  *
  * @module dsh-pause/rpc-channel
  */
