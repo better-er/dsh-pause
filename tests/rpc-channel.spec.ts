@@ -78,7 +78,7 @@ function makeResponse(): FakeResponse {
 /** 挂载一条通道，返回 webServer 收到的路由；服务缺席时返回 undefined。 */
 function mount(
   handler: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<RpcChannelResult>,
-  options: { rejection?: 401 | 403; connection?: boolean; webServer?: boolean } = {},
+  options: { rejection?: 401 | 403; connection?: boolean; webServer?: boolean; maxBodyBytes?: number } = {},
 ): RegisteredRoute | undefined {
   let route: RegisteredRoute | undefined
   const scope = {
@@ -101,7 +101,7 @@ function mount(
       return undefined
     },
   }
-  mountRpcChannel(ctx, '/dsh-pause', handler)
+  mountRpcChannel(ctx, '/dsh-pause', handler, options.maxBodyBytes === undefined ? {} : { maxBodyBytes: options.maxBodyBytes })
   return route
 }
 
@@ -198,10 +198,11 @@ describe('mountRpcChannel', () => {
   })
 
   it('请求体超限回 413、带 connection: close 并断开请求', async () => {
-    const route = mount(okHandler)!
+    const limit = 64 * 1024
+    const route = mount(okHandler, { maxBodyBytes: limit })!
     const res = makeResponse()
     let destroyed = false
-    const req = makeRequest({ body: Buffer.alloc(8 * 1024 * 1024 + 1) })
+    const req = makeRequest({ body: Buffer.alloc(limit + 1) })
     req.destroy = (): void => { destroyed = true }
     await route.handler(req, res)
     expect(res.statusCode).toBe(413)
@@ -210,9 +211,10 @@ describe('mountRpcChannel', () => {
   })
 
   it('content-length 预声明超限即快速 413', async () => {
-    const route = mount(okHandler)!
+    const limit = 64 * 1024
+    const route = mount(okHandler, { maxBodyBytes: limit })!
     const res = makeResponse()
-    await route.handler(makeRequest({ headers: { 'content-type': 'application/json', 'content-length': String(8 * 1024 * 1024 + 1) } }), res)
+    await route.handler(makeRequest({ headers: { 'content-type': 'application/json', 'content-length': String(limit + 1) } }), res)
     expect(res.statusCode).toBe(413)
   })
 

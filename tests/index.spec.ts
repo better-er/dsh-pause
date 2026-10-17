@@ -34,6 +34,22 @@ async function rpc(method: string, payload: unknown): Promise<any> {
   return body.result
 }
 
+/** 附件服务桩：记录准入输入，把图片换成固定的持久引用。 */
+function fakeAttachments() {
+  const state: { input: unknown[] } = { input: [] }
+  return {
+    state,
+    store: {
+      async admitPromptContent(parts: any[]) {
+        state.input = parts
+        return parts.map((part) => part.type === 'text'
+          ? part
+          : { type: 'image', attachment: { attachmentId: 'sha256:test', mediaType: part.mediaType, bytes: 3, width: 1, height: 1 } })
+      },
+    },
+  }
+}
+
 /** 造一个桩 ctx：捕获 apply 注册的 pre-step 监听，并接住自注册的 prefix 路由。 */
 function harness(enabledDefault = false) {
   let preStepListener: PreStepListener | undefined
@@ -47,15 +63,17 @@ function harness(enabledDefault = false) {
     },
     effect(cb: () => unknown) { return cb() },
   }
+  const attachments = fakeAttachments()
   const ctx = {
     on(_name: string, listener: any) {
       if (_name === 'agent/pre-step') preStepListener = listener as PreStepListener
       return () => true
     },
     inject(_deps: string[], cb: (s: unknown) => void) { cb(scope) },
+    get(name: string) { return name === 'attachments' ? attachments.store : undefined },
   }
   apply(ctx as any, { defaultEnabled: enabledDefault })
-  return { get preStep() { return preStepListener! } }
+  return { get preStep() { return preStepListener! }, attachments }
 }
 
 describe('apply host wiring', () => {
@@ -116,6 +134,53 @@ describe('apply host wiring', () => {
     expect(decision.kind).toBe('enter')
     expect(decision.messages).toHaveLength(1)
     expect(decision.messages[0].content).toMatchObject([{ type: 'text', text: '先别跑，我再想想' }])
+  })
+
+  it('带图放行：图片经附件服务准入后与文字并入同一条 user 消息', async () => {
+    const h = harness(true)
+    const base = { kind: 'enter' as const, messages: [] }
+    const p = h.preStep(
+      { agent: { id: 's4' }, turn: 1, step: 2, signal: new AbortController().signal, messages: [] },
+      async () => base,
+    )
+    await Promise.resolve()
+    const rel = await rpc('release', {
+      sessionId: 's4',
+      text: ' 看这张图 ',
+      images: [{ mediaType: 'image/png', data: 'AAAA', name: 'a.png' }],
+    })
+    expect(rel.ok).toBe(true)
+    expect(rel.value.released).toBe(true)
+    expect(h.attachments.state.input).toEqual([
+      { type: 'text', text: '看这张图' },
+      { type: 'image', mediaType: 'image/png', data: 'AAAA', name: 'a.png' },
+    ])
+    const decision = await p
+    expect(decision.messages).toHaveLength(1)
+    expect(decision.messages[0].content).toMatchObject([
+      { type: 'text', text: '看这张图' },
+      { type: 'image', attachment: { mediaType: 'image/png' } },
+    ])
+  })
+
+  it('图片类型非法时拒绝放行且门保持', async () => {
+    const h = harness(true)
+    const base = { kind: 'enter' as const, messages: [] }
+    const p = h.preStep(
+      { agent: { id: 's5' }, turn: 1, step: 2, signal: new AbortController().signal, messages: [] },
+      async () => base,
+    )
+    await Promise.resolve()
+    const rel = await rpc('release', {
+      sessionId: 's5',
+      text: '',
+      images: [{ mediaType: 'image/svg+xml', data: 'AAAA' }],
+    })
+    expect(rel.ok).toBe(false)
+    expect((await rpc('status', { sessionId: 's5' })).value.paused).toBe(true)
+    // 收尾：关闭开关放行，避免测试留下悬挂的 Promise。
+    await rpc('setEnabled', { sessionId: 's5', enabled: false })
+    await p
   })
 
   it('无门时 release 返回 released:false', async () => {

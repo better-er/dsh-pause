@@ -7,7 +7,7 @@ import {
   PauseRegistry,
   initialSessionState,
   shouldPause,
-  textToMessages,
+  textToMessage,
 } from '../src/controller.ts'
 
 describe('shouldPause', () => {
@@ -23,15 +23,14 @@ describe('shouldPause', () => {
   })
 })
 
-describe('textToMessages', () => {
+describe('textToMessage', () => {
   it('空/空白文字不产生消息', () => {
-    expect(textToMessages('')).toHaveLength(0)
-    expect(textToMessages('   ')).toHaveLength(0)
+    expect(textToMessage('')).toBeUndefined()
+    expect(textToMessage('   ')).toBeUndefined()
   })
   it('非空文字产生一条 user 文本消息', () => {
-    const msgs = textToMessages('先别动手，我再想想')
-    expect(msgs).toHaveLength(1)
-    expect(msgs[0]?.content).toMatchObject([{ type: 'text', text: '先别动手，我再想想' }])
+    const msg = textToMessage('先别动手，我再想想')
+    expect(msg?.content).toMatchObject([{ type: 'text', text: '先别动手，我再想想' }])
   })
 })
 
@@ -46,25 +45,26 @@ describe('PauseRegistry', () => {
     reg.setEnabled('s', true)
     expect(reg.enabled('s')).toBe(true)
   })
-  it('arm/release 门控：release 携带文字并复位', async () => {
+  it('arm/release 门控：release 携带补充消息并复位', async () => {
     const reg = new PauseRegistry(false)
     reg.setEnabled('s', true)
-    const gate = new Promise<string>((resolve) => {
+    const message = textToMessage('补一句')
+    const gate = new Promise<unknown>((resolve) => {
       reg.armGate('s', { resolve, reject: () => {} })
     })
     expect(reg.isPaused('s')).toBe(true)
-    const released = reg.release('s', '补一句')
+    const released = reg.release('s', message)
     expect(released).toBe(true)
-    await expect(gate).resolves.toBe('补一句')
+    await expect(gate).resolves.toBe(message)
     expect(reg.isPaused('s')).toBe(false)
   })
   it('无门时 release 返回 false', () => {
     const reg = new PauseRegistry(false)
-    expect(reg.release('s', '')).toBe(false)
+    expect(reg.release('s', undefined)).toBe(false)
   })
   it('abort 中止门并复位', async () => {
     const reg = new PauseRegistry(false)
-    const gate = new Promise<string>((_, reject) => {
+    const gate = new Promise<unknown>((_, reject) => {
       reg.armGate('s', { resolve: () => {}, reject })
     })
     reg.abortGate('s', new Error('cancelled'))

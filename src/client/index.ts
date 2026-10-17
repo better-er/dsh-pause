@@ -10,19 +10,21 @@
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client'
 import type { ClientConnectionRpc } from '@deepseek-ai/dsh-client-connection/client'
-import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type { ConversationController, DraftAttachmentId, SubmitAttachment } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { PauseControl } from './PauseBar.tsx'
 
 /** 插件名即配置项 id。 */
 export const name = 'dsh-pause'
-/** 本插件需要的客户端服务。 */
-export const inject = ['slots', 'connection']
+/** 本插件需要的客户端服务。conversation 用于把草稿附件序列化成可随插话提交的载荷。 */
+export const inject = ['slots', 'connection', 'conversation']
 
 /** 注册时注入读条组件、按钮所需的业务面。 */
 export interface PauseBarInjected {
   /** Connection RPC 调用器，主机端提供 /dsh-pause。 */
   readonly rpc: ClientConnectionRpc
+  /** 把草稿附件序列化成图片 base64 或文件 receipt；图片在主机侧持久化后随插话发出。 */
+  readonly serializeAttachments: (ids: readonly DraftAttachmentId[]) => Promise<readonly SubmitAttachment[]>
 }
 
 /**
@@ -31,13 +33,23 @@ export interface PauseBarInjected {
  */
 export function apply(ctx: ClientContext): void {
   const connection = (ctx as unknown as { connection: ConnectionHandle }).connection
+  const conversation = (ctx as unknown as { conversation: ConversationController }).conversation
   ctx.slots.inject('conversation.input.right', () =>
     ctx.slots.register(
       {
         name: 'conversation.input.right',
         id: 'dsh-pause',
         order: 30,
-        inject: (): PauseBarInjected => ({ rpc: connection.rpc }),
+        inject: (): PauseBarInjected => ({
+          rpc: connection.rpc,
+          serializeAttachments: async (ids: readonly DraftAttachmentId[]) => {
+            // 文件附件走官方提交与 receipt 绑定，本插件暂不接管，提前给出可操作的提示。
+            if (conversation.resolveDraftAttachments(ids).some((draft) => draft.kind !== 'image')) {
+              throw new Error('暂停中只支持图片插话，请先移除文件附件')
+            }
+            return (await conversation.serializeDraftAttachments(ids)).attachments
+          },
+        }),
       },
       PauseControl,
     ),

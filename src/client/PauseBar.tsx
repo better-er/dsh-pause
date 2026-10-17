@@ -13,14 +13,16 @@
 import { memo, useEffect, useRef, useState } from 'react'
 import type { ReactElement } from 'react'
 import type { SnapshotSelectorHook } from '@deepseek-ai/dsh-client-ui-slots'
-import type { InputActions, InputState } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type { DraftAttachmentId, InputActions, InputState, SubmitAttachment } from '@deepseek-ai/dsh-client-ui-conversation/client'
 
 /** 注册时注入读条组件、按钮所需的业务面。 */
 export interface PauseBarInjected {
   /** Connection RPC 调用器，主机端提供 /dsh-pause。 */
   readonly rpc: {
-    call(channel: string, endpoint: string, payload: unknown): Promise<{ ok: boolean; value?: unknown }>
+    call(channel: string, endpoint: string, payload: unknown): Promise<{ ok: boolean; value?: unknown; error?: { message?: string } }>
   }
+  /** 把草稿附件序列化成可随插话提交的载荷。 */
+  readonly serializeAttachments?: (ids: readonly DraftAttachmentId[]) => Promise<readonly SubmitAttachment[]>
 }
 
 /** conversation.input.right 的 session 作用域组件收到的标准 props + 注入面。 */
@@ -49,13 +51,25 @@ async function fetchStatus(rpc: PauseBarInjected['rpc'], sessionId: string): Pro
   }
 }
 
-async function callRelease(rpc: PauseBarInjected['rpc'], sessionId: string, text: string): Promise<boolean> {
+/** 一次放行的结果；error 存在表示主机拒绝，门未放行。 */
+interface ReleaseOutcome {
+  readonly released: boolean
+  readonly error?: string
+}
+
+async function callRelease(
+  rpc: PauseBarInjected['rpc'],
+  sessionId: string,
+  text: string,
+  images: readonly SubmitAttachment[],
+): Promise<ReleaseOutcome> {
   try {
-    const result = await rpc.call('/dsh-pause', 'release', { sessionId, text })
-    const value = result.ok ? (result.value as { released?: boolean } | undefined) : undefined
-    return value?.released === true
-  } catch {
-    return false
+    const result = await rpc.call('/dsh-pause', 'release', { sessionId, text, images })
+    if (!result.ok) return { released: false, error: result.error?.message ?? '放行失败' }
+    const value = result.value as { released?: boolean } | undefined
+    return { released: value?.released === true }
+  } catch (error) {
+    return { released: false, error: error instanceof Error ? error.message : String(error) }
   }
 }
 
@@ -67,19 +81,51 @@ async function callSetEnabled(rpc: PauseBarInjected['rpc'], sessionId: string, e
   }
 }
 
-/** 放行一扇门：draft 为空 = 无感继续；有字 = 插话并清空草稿。 */
+/**
+ * 放行一扇门：draft 与图片一起作为插话，空则无感继续。
+ * 附件必须先序列化并随放行请求上传；主机拒绝时保持门与草稿原样，避免出现只发文字、图片残留的状态。
+ */
 async function releaseAndClear(
   rpc: PauseBarInjected['rpc'],
   sessionId: string,
   draft: string,
+  attachmentIds: readonly DraftAttachmentId[],
+  serializeAttachments: PauseBarInjected['serializeAttachments'],
   inputActions: InputActions | undefined,
   onDone: () => void,
+  onError: (message: string) => void,
 ): Promise<void> {
-  const released = await callRelease(rpc, sessionId, draft)
-  if (released) {
-    if (draft !== '' && inputActions !== undefined) inputActions.setDraft('')
-    onDone()
+  let attachments: readonly SubmitAttachment[] = []
+  if (attachmentIds.length > 0) {
+    if (serializeAttachments === undefined) {
+      onError('当前环境不支持附件插话，请先发送或移除附件')
+      return
+    }
+    try {
+      attachments = await serializeAttachments(attachmentIds)
+    } catch (error) {
+      onError('附件无法随插话发送：' + (error instanceof Error ? error.message : String(error)))
+      return
+    }
   }
+  if (attachments.some((part) => part.type !== 'image')) {
+    onError('暂停中只支持图片插话，请先移除文件附件')
+    return
+  }
+  const outcome = await callRelease(rpc, sessionId, draft, attachments)
+  if (outcome.error !== undefined) {
+    onError(outcome.error)
+    return
+  }
+  if (!outcome.released) {
+    onDone()
+    return
+  }
+  if (draft !== '' && inputActions !== undefined) inputActions.setDraft('')
+  if (inputActions !== undefined) {
+    for (const id of attachmentIds) inputActions.removeAttachment(id)
+  }
+  onDone()
 }
 
 /**
@@ -102,19 +148,44 @@ export const PauseControl = memo(function PauseControl({
   sessionId,
   useInput,
   inputActions,
+  serializeAttachments,
 }: PauseControlProps) {
   const [enabled, setEnabled] = useState(false)
   const [paused, setPaused] = useState(false)
+  const [error, setError] = useState<string | undefined>(undefined)
   const rootRef = useRef<HTMLDivElement | null>(null)
 
-  // render 内 subscribe：草稿变化会触发本组件重渲染并更新 ref。
+  // render 内 subscribe：草稿与附件变化会触发本组件重渲染并更新 ref。
   // 注意：不能在 capture 事件处理器里调 useInput，因为 hook 只在 render 期合法，故存 ref。
   const draft = useInput((state: InputState) => state.draft)
+  const attachmentIds = useInput((state: InputState) => state.attachmentIds)
   const draftRef = useRef(draft)
   draftRef.current = draft
+  const idsRef = useRef(attachmentIds)
+  idsRef.current = attachmentIds
   // capture 处理器要读最新 paused/rpc/sessionId/inputActions，也用 ref 规避闭包过期。
-  const gateRef = useRef({ paused, release: () => releaseAndClear(rpc, sessionId, draftRef.current, inputActions, () => setPaused(false)) })
-  gateRef.current = { paused, release: () => releaseAndClear(rpc, sessionId, draftRef.current, inputActions, () => setPaused(false)) }
+  const gateRef = useRef<{ paused: boolean; release: () => void }>({ paused: false, release: () => {} })
+  // 放行中的重复 Enter 或连点不再发起第二次上传，避免同一批图片被提交两次。
+  const releasingRef = useRef(false)
+  gateRef.current = {
+    paused,
+    release: () => {
+      if (releasingRef.current) return
+      releasingRef.current = true
+      setError(undefined)
+      const pending = releaseAndClear(
+        rpc,
+        sessionId,
+        draftRef.current,
+        idsRef.current,
+        serializeAttachments,
+        inputActions,
+        () => setPaused(false),
+        (message) => setError(message),
+      )
+      void pending.finally(() => { releasingRef.current = false })
+    },
+  }
 
   // 轮询主机端状态。
   useEffect(() => {
@@ -153,6 +224,7 @@ export const PauseControl = memo(function PauseControl({
   }, [paused])
 
   const toggle = async (next: boolean): Promise<void> => {
+    setError(undefined)
     setEnabled(next)
     await callSetEnabled(rpc, sessionId, next)
   }
@@ -211,6 +283,11 @@ export const PauseControl = memo(function PauseControl({
         >
           已暂停·回车或点此继续
         </button>
+      )}
+      {error !== undefined && (
+        <span style={{ color: 'var(--dsw-alias-label-error, #d9534f)', fontSize: '12px' }}>
+          {error}
+        </span>
       )}
     </div>
   )

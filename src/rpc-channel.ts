@@ -6,7 +6,7 @@
  * 自注册并非唯一出路。私有 register(owner, channel, handler) 显式接收 owner，不解析 this.ctx，在注入了 webServer 的作用域里可用，能完整复用官方 transport。代价是它标了 private，需要类型断言，且上游可能改名或移除。故这里选择自行实现同样的信封语义。
  *
  * 与官方 transport 的有意差异：
- * - 请求体上限 8 MiB；本插件载荷只有 sessionId 与短文字，远小于官方按 maxRequestBodyBytes 的默认 300 MiB。
+ * - 请求体上限按官方 maxRequestBodyBytes 默认的 300 MiB 设置；带图插话需随请求传图片的 base64，单图编码后可达数十 MiB。
  * - 信封校验手写，只认 type/method/rpcId，不用 clientRequestSchema 校验 payload 与 rpcId 形状。
  * - handler 抛错时回 200 信封、code 为 internal，而非官方 500 纯文本；本通道 handler 自带 try，实际不可达。
  *
@@ -57,8 +57,14 @@ interface Scope {
 
 /** 端点路径段的合法字符集，与官方 ENDPOINT_SEGMENT_PATTERN 一致。 */
 const SEGMENT = /^[A-Za-z0-9_$.-]+$/
-/** 请求体上限。本插件载荷极小，8 MiB 已远超实际，故不采用官方 300 MiB。 */
-const MAX_BODY_BYTES = 8 * 1024 * 1024
+/** 请求体上限，与官方 maxRequestBodyBytes 默认值一致；图片插话随请求传 base64，需给足空间。 */
+const MAX_BODY_BYTES = 300 * 1024 * 1024
+
+/** 挂载选项，测试可传更小的请求体上限以免真的分配数百 MiB。 */
+export interface MountOptions {
+  /** 请求体字节上限，默认 300 MiB。 */
+  maxBodyBytes?: number
+}
 /** 唯一接受的 content-type，与官方信封契约一致。 */
 const JSON_MIME = 'application/json'
 
@@ -70,15 +76,17 @@ class PayloadTooLargeError extends Error {}
  * @param ctx - 插件上下文。
  * @param channel - 绝对通道前缀，例如 /dsh-pause。
  * @param handler - 端点处理器。
+ * @param options - 挂载选项，目前只有请求体上限。
  */
-export function mountRpcChannel(ctx: Injectable, channel: string, handler: RpcChannelHandler): void {
+export function mountRpcChannel(ctx: Injectable, channel: string, handler: RpcChannelHandler, options: MountOptions = {}): void {
+  const maxBodyBytes = options.maxBodyBytes ?? MAX_BODY_BYTES
   ctx.inject(['connection', 'webServer'], (raw) => {
     const scope = raw as Scope
     scope.effect(
       () => scope.webServer.register({
         kind: 'prefix',
         path: channel,
-        handler: (req, res) => serve(scope.connection, channel, handler, req, res),
+        handler: (req, res) => serve(scope.connection, channel, handler, maxBodyBytes, req, res),
       }),
       `${channel}: rpc channel`,
     )
@@ -90,6 +98,7 @@ export function mountRpcChannel(ctx: Injectable, channel: string, handler: RpcCh
  * @param connection - connection 服务，用其信任判定。
  * @param channel - 本通道前缀。
  * @param handler - 端点处理器。
+ * @param maxBodyBytes - 请求体字节上限。
  * @param req - node 请求。
  * @param res - node 响应。
  */
@@ -97,6 +106,7 @@ async function serve(
   connection: ConnectionFace,
   channel: string,
   handler: RpcChannelHandler,
+  maxBodyBytes: number,
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
@@ -120,11 +130,11 @@ async function serve(
   }
   // 声明了超限 content-length 时先快速拒绝，不必把整份超限请求读完。
   const declared = Number(req.headers['content-length'])
-  if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) return tooLarge(req, res)
+  if (Number.isFinite(declared) && declared > maxBodyBytes) return tooLarge(req, res)
 
   let raw: string
   try {
-    raw = await readBody(req)
+    raw = await readBody(req, maxBodyBytes)
   } catch (error) {
     if (error instanceof PayloadTooLargeError) return tooLarge(req, res)
     res.writeHead(400)
@@ -191,14 +201,18 @@ function isJsonContentType(req: IncomingMessage): boolean {
   return mime !== undefined && mime.trim().toLowerCase() === JSON_MIME
 }
 
-/** 读取并限长请求体，超限抛 PayloadTooLargeError，由调用方回写 413。 */
-async function readBody(req: IncomingMessage): Promise<string> {
+/**
+ * 读取并限长请求体，超限抛 PayloadTooLargeError，由调用方回写 413。
+ * @param req - node 请求。
+ * @param maxBodyBytes - 请求体字节上限。
+ */
+async function readBody(req: IncomingMessage, maxBodyBytes: number): Promise<string> {
   const chunks: Buffer[] = []
   let size = 0
   for await (const chunk of req) {
     const buffer = typeof chunk === 'string' ? Buffer.from(chunk) : chunk as Buffer
     size += buffer.length
-    if (size > MAX_BODY_BYTES) throw new PayloadTooLargeError('rpc channel: request body exceeds limit')
+    if (size > maxBodyBytes) throw new PayloadTooLargeError('rpc channel: request body exceeds limit')
     chunks.push(buffer)
   }
   return Buffer.concat(chunks).toString('utf8')

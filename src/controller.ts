@@ -24,12 +24,10 @@ export interface PauseSessionState {
   waiting: ReleaseRequest | undefined
 }
 
-/** 一次放行请求：人类选择继续，可携带一段补充文字。 */
+/** 一次放行请求：人类选择继续，可携带一条已构造好的补充用户消息。 */
 export interface ReleaseRequest {
-  /** 放行时携带的补充文字，可为空串表示无感继续。 */
-  text: string
-  /** 解析放行等待的入口，由安装器在注册 pre-step 时提供。 */
-  resolve: (text: string) => void
+  /** 解析放行等待的入口，参数为待并入本步的补充消息，undefined 表示无感继续。 */
+  resolve: (message: UserMessage | undefined) => void
   reject: (reason: unknown) => void
 }
 
@@ -52,16 +50,17 @@ export function shouldPause(enabled: boolean, step: number): boolean {
 
 /**
  * 把一段补充文字转成要并进 step 的 user 消息。空文字不产生消息。
+ * 带图插话由安装器先经附件服务持久化，再调用本函数无法表达，故只处理纯文字。
  * @param text 人类输入的补充文字。
- * @returns 待并入的 user 消息数组；空文字返回空数组。
+ * @returns 待并入的 user 消息；空白文字返回 undefined。
  */
-export function textToMessages(text: string): UserMessage[] {
+export function textToMessage(text: string): UserMessage | undefined {
   const trimmed = text.trim()
-  if (trimmed === '') return []
-  return [createUserMessage({
+  if (trimmed === '') return undefined
+  return createUserMessage({
     content: [{ type: 'text', text: trimmed }],
     source: { kind: 'user' },
-  })]
+  })
 }
 
 /** 会话状态在安装器里的默认初始值。 */
@@ -105,15 +104,15 @@ export class PauseRegistry {
   }
 
   /**
-   * 放行一扇门。若该会话当前正挂着门，用给定文字放行并返回 true；否则返回 false。
+   * 放行一扇门。若该会话当前正挂着门，用给定补充消息放行并返回 true；否则返回 false。
    * 放行后状态复位为未暂停，因为这一步已经放行。
    */
-  release(sessionId: string, text: string): boolean {
+  release(sessionId: string, message: UserMessage | undefined): boolean {
     const s = this.stateFor(sessionId)
     if (s.waiting === undefined) return false
     const resolve = s.waiting.resolve
     this.states.set(sessionId, { enabled: s.enabled, paused: false, waiting: undefined })
-    resolve(text)
+    resolve(message)
     return true
   }
 
@@ -123,7 +122,7 @@ export class PauseRegistry {
     this.states.set(sessionId, {
       enabled: s.enabled,
       paused: true,
-      waiting: { text: '', resolve: resolvers.resolve, reject: resolvers.reject },
+      waiting: { resolve: resolvers.resolve, reject: resolvers.reject },
     })
   }
 
