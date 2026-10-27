@@ -45,30 +45,71 @@ describe('PauseRegistry', () => {
     reg.setEnabled('s', true)
     expect(reg.enabled('s')).toBe(true)
   })
-  it('arm/release 门控：release 携带补充消息并复位', async () => {
+  it('arm/release 暂停点：release 携带补充消息并复位', async () => {
     const reg = new PauseRegistry(false)
     reg.setEnabled('s', true)
     const message = textToMessage('补一句')
-    const gate = new Promise<unknown>((resolve) => {
-      reg.armGate('s', { resolve, reject: () => {} })
+    const pausePoint = new Promise<unknown>((resolve) => {
+      reg.armPausePoint('s', { resolve, reject: () => {} })
     })
     expect(reg.isPaused('s')).toBe(true)
     const released = reg.release('s', message)
     expect(released).toBe(true)
-    await expect(gate).resolves.toBe(message)
+    await expect(pausePoint).resolves.toBe(message)
     expect(reg.isPaused('s')).toBe(false)
   })
-  it('无门时 release 返回 false', () => {
+  it('没有暂停点时 release 返回 false', () => {
     const reg = new PauseRegistry(false)
     expect(reg.release('s', undefined)).toBe(false)
   })
-  it('abort 中止门并复位', async () => {
+  it('abort 中止暂停点并复位', async () => {
     const reg = new PauseRegistry(false)
-    const gate = new Promise<unknown>((_, reject) => {
-      reg.armGate('s', { resolve: () => {}, reject })
+    const pausePoint = new Promise<unknown>((_, reject) => {
+      reg.armPausePoint('s', { resolve: () => {}, reject })
     })
-    reg.abortGate('s', new Error('cancelled'))
-    await expect(gate).rejects.toThrow('cancelled')
+    reg.abortPausePoint('s', new Error('cancelled'))
+    await expect(pausePoint).rejects.toThrow('cancelled')
+    expect(reg.isPaused('s')).toBe(false)
+  })
+  it('没有暂停点时 release 返回 false 且不动队列', () => {
+    const reg = new PauseRegistry(false)
+    expect(reg.release('s', undefined)).toBe(false)
+    expect(reg.pendingMessageCount('s')).toBe(0)
+  })
+  it('待插话队列先进先出，take 一次取走全部', () => {
+    const reg = new PauseRegistry(false)
+    const first = textToMessage('第一条')!
+    const second = textToMessage('第二条')!
+    reg.queueMessage('s', first)
+    reg.queueMessage('s', second)
+    expect(reg.pendingMessageCount('s')).toBe(2)
+    expect(reg.takePendingMessages('s')).toEqual([first, second])
+    expect(reg.pendingMessageCount('s')).toBe(0)
+    expect(reg.takePendingMessages('s')).toEqual([])
+  })
+  it('该步被 reject 时把待插话放回队首', () => {
+    const reg = new PauseRegistry(false)
+    const first = textToMessage('第一条')!
+    reg.queueMessage('s', first)
+    const taken = reg.takePendingMessages('s')
+    reg.requeueMessages('s', taken)
+    expect(reg.pendingMessageCount('s')).toBe(1)
+    expect(reg.takePendingMessages('s')[0]).toBe(first)
+  })
+  it('busy 只记录 agent 是否在跑，不动队列', () => {
+    const reg = new PauseRegistry(false)
+    reg.setBusy('s', true)
+    reg.queueMessage('s', textToMessage('还在跑')!)
+    reg.setBusy('s', false)
+    expect(reg.isBusy('s')).toBe(false)
+    expect(reg.pendingMessageCount('s')).toBe(1)
+  })
+  it('isPaused 直接由暂停点是否存在推出', () => {
+    const reg = new PauseRegistry(false)
+    expect(reg.isPaused('s')).toBe(false)
+    reg.armPausePoint('s', { resolve: () => {}, reject: () => {} })
+    expect(reg.isPaused('s')).toBe(true)
+    reg.release('s', undefined)
     expect(reg.isPaused('s')).toBe(false)
   })
   it('stateFor 幂等返回同一会话状态对象', () => {
@@ -76,6 +117,11 @@ describe('PauseRegistry', () => {
     expect(reg.stateFor('x')).toBe(reg.stateFor('x'))
   })
   it('initialSessionState 默认关且未暂停', () => {
-    expect(initialSessionState()).toEqual({ enabled: false, paused: false, waiting: undefined })
+    expect(initialSessionState()).toEqual({
+      enabled: false,
+      busy: false,
+      pausePoint: undefined,
+      pendingMessages: [],
+    })
   })
 })
