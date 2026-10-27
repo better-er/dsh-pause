@@ -8,6 +8,7 @@ import { mountRpcChannel, type RpcChannelHandler, type RpcChannelResult } from '
 declare module '@deepseek-ai/cordis' {
   interface Events {
     'agent/pre-step'(this: never, payload: PreStepPayload, next: () => Promise<PreStepDecision>): Promise<PreStepDecision>
+    'agent/status'(this: never, payload: AgentStatusPayload): void
   }
 }
 
@@ -27,6 +28,13 @@ interface PreStepPayload {
   messages: UserMessage[]
 }
 type PreStepDecision = { kind: 'reject' } | { kind: 'enter'; messages: UserMessage[]; startsRequestSeries?: true }
+
+/** agent/status 只报 idle 与 running 两个值，用来判断 turn 是否还可能挂下一个暂停点。 */
+interface AgentStatusPayload {
+  /** followup 用于把 turn 结束时还没送出的插话当场发出去。 */
+  agent: { id: string; followup(message: UserMessage): void }
+  status: 'idle' | 'running'
+}
 
 /** 浏览器可随插话提交的图片媒体类型，与附件服务的准入集合一致。 */
 type ImageMediaType = 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
@@ -114,6 +122,9 @@ export function apply(ctx: Context, config: Config = {}): void {
   const defaultEnabled = config.defaultEnabled === true
   const registry = new PauseRegistry(defaultEnabled)
 
+  // 记住每个 agent 的活引用，空闲时按回车可以把插话直接 followup 成新 turn。
+  const agents = new Map<string, AgentStatusPayload['agent']>()
+
   const handler: RpcChannelHandler = async (endpoint, payload) => {
     try {
       switch (endpoint) {
@@ -121,22 +132,51 @@ export function apply(ctx: Context, config: Config = {}): void {
           const { sessionId, enabled } = payload as EnableBody
           if (typeof sessionId !== 'string' || typeof enabled !== 'boolean') return rpcError('setEnabled requires sessionId:string, enabled:boolean')
           registry.setEnabled(sessionId, enabled)
-          // 关闭开关时应放行任何正挂着的门，避免 driver 卡在暂停态无法前进。
+          // 关闭开关时应放行任何正挂着的暂停点，避免 driver 卡在暂停态无法前进。
           if (!enabled && registry.isPaused(sessionId)) registry.release(sessionId, undefined)
           return ok({ paused: registry.isPaused(sessionId) })
         }
         case 'release': {
           const { sessionId, text, images } = payload as ReleaseBody
           if (typeof sessionId !== 'string') return rpcError('release requires sessionId:string')
-          // 没有门时直接返回，避免白存图片留下无主附件。
-          if (!registry.isPaused(sessionId)) return ok({ released: false })
+          const paused = registry.isPaused(sessionId)
+          const textLength = typeof text === 'string' ? text.trim().length : 0
+          const imageCount = Array.isArray(images) ? images.length : 0
+          if (!paused) {
+            // 没有暂停点时由 agent 是否在跑来裁决：还在跑说明下一个暂停点会来，消息先排队；
+            // 已经空闲则不会再有暂停点，有 agent 活引用就直接 followup 开一条新 turn。
+            if (textLength === 0 && imageCount === 0) {
+              return ok({ released: false, busy: registry.isBusy(sessionId), queued: false })
+            }
+            const message = await buildReleaseMessage(ctx, text, images)
+            if (message === undefined) return ok({ released: false, busy: registry.isBusy(sessionId), queued: false })
+            // 构建消息期间 turn 可能已经结束，这种时候直接 followup 开新 turn。
+            if (!registry.isBusy(sessionId)) {
+              const agent = agents.get(sessionId)
+              if (agent !== undefined) {
+                // 没有暂停点也不会再有：按了就发出去，直接开一条新 turn。
+                agent.followup(message)
+                return ok({ released: false, busy: false, queued: true })
+              }
+              // 没有 agent 活引用，主机现在发不出去。不静默入队，交回客户端暂存，下次按回车再试。
+              return ok({ released: false, busy: false, queued: false })
+            }
+            registry.queueMessage(sessionId, message)
+            return ok({ released: false, busy: true, queued: true })
+          }
           const message = await buildReleaseMessage(ctx, text, images)
-          return ok({ released: registry.release(sessionId, message) })
+          const released = registry.release(sessionId, message)
+          return ok({ released, busy: registry.isBusy(sessionId), queued: false })
         }
         case 'status': {
           const { sessionId } = payload as StatusBody
           if (typeof sessionId !== 'string') return rpcError('status requires sessionId:string')
-          return ok({ enabled: registry.enabled(sessionId), paused: registry.isPaused(sessionId) })
+          return ok({
+            enabled: registry.enabled(sessionId),
+            paused: registry.isPaused(sessionId),
+            busy: registry.isBusy(sessionId),
+            pendingMessageCount: registry.pendingMessageCount(sessionId),
+          })
         }
         default: return rpcError('unknown endpoint ' + endpoint)
       }
@@ -147,29 +187,86 @@ export function apply(ctx: Context, config: Config = {}): void {
   // connection.rpc.handle 自 0.1.2-rc.1 起即不可用，登记路由时解析 webServer 会抛 without inject，故改为插件自注册通道。
   mountRpcChannel(ctx, '/dsh-pause', handler)
 
+  // agent/status 是判断「暂停点还会不会来」的唯一依据：running 时下一个迟早挂上，idle 时永远不会。
+  ctx.on('agent/status', (payload: AgentStatusPayload) => {
+    const sessionId = payload.agent.id
+    agents.set(sessionId, payload.agent)
+    const busy = payload.status === 'running'
+    if (registry.isBusy(sessionId) !== busy) registry.setBusy(sessionId, busy)
+    if (busy) return
+    // turn 已经结束，排队的插话等不到暂停点了。按了回车就一定发出去：直接 followup 开一条新 turn。
+    // 不因 busy 未变而提前返回：队列里可能有暂停点该步被 reject 时放回的消息，要借这次派发再试。
+    const leftover = registry.takePendingMessages(sessionId)
+    if (leftover.length === 0) return
+    // 让本次 status 派发先结束，避免 followup 唤醒 driver 时重入同一个事件。
+    queueMicrotask(() => {
+      const failed: UserMessage[] = []
+      for (const message of leftover) {
+        try {
+          payload.agent.followup(message)
+        } catch {
+          failed.push(message)
+        }
+      }
+      // 补发失败时放回队列，等下一次状态派发或暂停点再试。
+      if (failed.length > 0) registry.requeueMessages(sessionId, failed)
+    })
+  })
+
   ctx.on('agent/pre-step', async (payload: PreStepPayload, next: () => Promise<PreStepDecision>) => {
     const sessionId = payload.agent.id
     const state = registry.stateFor(sessionId)
     if (payload.step <= 1 || !state.enabled) return next()
+    registry.setBusy(sessionId, true)
 
-    let resolveGate: (message: UserMessage | undefined) => void = () => {}
-    let rejectGate: (reason: unknown) => void = () => {}
-    const gate = new Promise<UserMessage | undefined>((resolve, reject) => { resolveGate = resolve; rejectGate = reject })
-    registry.armGate(sessionId, { resolve: resolveGate, reject: rejectGate })
+    // 人类在暂停点挂上之前就按了回车，视作预放行这一步：不再挂暂停点，直接把插话并入本步。
+    const preapproved = registry.takePendingMessages(sessionId)
+    if (preapproved.length > 0) {
+      try {
+        const decision = await next()
+        if (decision.kind === 'reject') {
+          registry.requeueMessages(sessionId, preapproved)
+          return decision
+        }
+        return { ...decision, messages: [...decision.messages, ...preapproved] }
+      } catch (error) {
+        // driver 抛错同样算这一步没发出去，队列放回，绝不让消息跟着异常一起消失。
+        registry.requeueMessages(sessionId, preapproved)
+        throw error
+      }
+    }
 
-    const onAbort = (): void => { registry.abortGate(sessionId, payload.signal.reason) }
+    let resolvePausePoint: (message: UserMessage | undefined) => void = () => {}
+    let rejectPausePoint: (reason: unknown) => void = () => {}
+    const pausePoint = new Promise<UserMessage | undefined>((resolve, reject) => {
+      resolvePausePoint = resolve
+      rejectPausePoint = reject
+    })
+    registry.armPausePoint(sessionId, { resolve: resolvePausePoint, reject: rejectPausePoint })
+
+    const onAbort = (): void => { registry.abortPausePoint(sessionId, payload.signal.reason) }
     if (payload.signal.aborted) onAbort()
     else payload.signal.addEventListener('abort', onAbort, { once: true })
 
     let carried: UserMessage | undefined
-    try { carried = await gate } catch { /* aborted */ } finally { payload.signal.removeEventListener('abort', onAbort) }
+    try { carried = await pausePoint } catch { /* aborted */ } finally { payload.signal.removeEventListener('abort', onAbort) }
 
-    const decision = await next()
-    if (decision.kind === 'reject') return decision
+    let decision: PreStepDecision
+    try {
+      decision = await next()
+    } catch (error) {
+      if (carried !== undefined) registry.requeueMessages(sessionId, [carried])
+      throw error
+    }
+    if (decision.kind === 'reject') {
+      // 这一步被 reject 时放行的插话没有送达，放回队列而不是丢掉。
+      if (carried !== undefined) registry.requeueMessages(sessionId, [carried])
+      return decision
+    }
     return carried === undefined ? decision : { ...decision, messages: [...decision.messages, carried] }
   })
 }
 
 export { PauseRegistry } from './controller.ts'
 export { shouldPause, textToMessage, initialSessionState, DEFAULT_ENABLED } from './controller.ts'
-export type { PauseSessionState, ReleaseRequest } from './controller.ts'
+export type { PauseSessionState, PausePoint } from './controller.ts'

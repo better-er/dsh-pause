@@ -1,6 +1,6 @@
 {
   "name": "dsh-pause",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "packageManager": "pnpm@9.15.9",
   "engines": {
     "node": ">=26.3.1"
@@ -54,6 +54,11 @@
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.0",
     "@deepseek-ai/dsh": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-connection": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-conversation": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-renderer": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-slots": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "^0.2.0-rc.2",
     "react": "^18.2.0"
   },
   "dependencies": {
