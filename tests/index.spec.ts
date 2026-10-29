@@ -1,14 +1,13 @@
 /**
  * dsh-pause host apply 的接线级测试。
  * 用桩 ctx 捕获 agent/pre-step 监听与 RPC 处理器。
- * 驱动「暂停 → RPC release 放行 → next() 放行该步」与「带文字放行并入 user 消息」两条路径。
+ * 驱动「暂停 → RPC release 放行 → next() 放行该步」「带文字放行并入 user 消息」与「无暂停点时立即 steer」三条路径。
  */
 import http from 'node:http'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { apply } from '../src/index.ts'
 
 type PreStepListener = (payload: any, next: () => Promise<any>) => Promise<any>
-type StatusListener = (payload: { agent: { id: string }; status: 'idle' | 'running' }) => void
 type RouteHandler = (req: http.IncomingMessage, res: http.ServerResponse) => void | Promise<void>
 
 /** apply 自注册的路由处理器，由最近一次 harness 捕获。 */
@@ -52,9 +51,9 @@ function fakeAttachments() {
 }
 
 /** 造一个桩 ctx：捕获 apply 注册的 pre-step 监听，并接住自注册的 prefix 路由。 */
-function harness(enabledDefault = false) {
+function harness(enabledDefault = false, withAgents = true, withAgentPayload = true) {
   let preStepListener: PreStepListener | undefined
-  let statusListener: StatusListener | undefined
+  let statusListener: ((payload: any) => void) | undefined
   const scope = {
     connection: { requestRejection: () => undefined },
     webServer: {
@@ -66,32 +65,38 @@ function harness(enabledDefault = false) {
     effect(cb: () => unknown) { return cb() },
   }
   const attachments = fakeAttachments()
+  const steered: { sessionId: string; message: any }[] = []
+  let steerThrows = false
+  const agentOf = (id: string) => ({
+    id,
+    steer(message: any) {
+      if (steerThrows) throw new Error('steer failed')
+      steered.push({ sessionId: id, message })
+    },
+  })
+  const agents = { get: (sessionId: string) => agentOf(sessionId) }
   const ctx = {
     on(_name: string, listener: any) {
       if (_name === 'agent/pre-step') preStepListener = listener as PreStepListener
-      if (_name === 'agent/status') statusListener = listener as StatusListener
+      if (_name === 'agent/status') statusListener = listener as (payload: any) => void
       return () => true
     },
     inject(_deps: string[], cb: (s: unknown) => void) { cb(scope) },
-    get(name: string) { return name === 'attachments' ? attachments.store : undefined },
+    get(name: string) {
+      if (name === 'attachments') return attachments.store
+      return name === 'agents' && withAgents ? agents : undefined
+    },
+    agents: withAgents ? agents : undefined,
   }
-  const followed: { sessionId: string; message: any }[] = []
   apply(ctx as any, { defaultEnabled: enabledDefault })
   return {
-    get preStep() { return preStepListener! },
-    status(sessionId: string, status: 'idle' | 'running', followupThrows = false) {
-      statusListener!({
-        agent: {
-          id: sessionId,
-          followup(message: any) {
-            if (followupThrows) throw new Error('followup failed')
-            followed.push({ sessionId, message })
-          },
-        },
-        status,
-      })
+    preStep(payload: any, next: () => Promise<any>) {
+      const agent = withAgentPayload ? agentOf(payload.agent.id) : payload.agent
+      return preStepListener!({ ...payload, agent }, next)
     },
-    followed,
+    status(payload: any) { statusListener!(payload) },
+    steered,
+    setSteerThrows(value: boolean) { steerThrows = value },
     attachments,
   }
 }
@@ -203,129 +208,103 @@ describe('apply host wiring', () => {
     await p
   })
 
-  it('没有暂停点且空闲时 release 返回 released:false 与 busy:false', async () => {
-    harness(true)
-    const rel = await rpc('release', { sessionId: 'nobody', text: '' })
-    expect(rel.value).toMatchObject({ released: false, busy: false, queued: false })
+  it('没有暂停点时空回车不 steer', async () => {
+    const h = harness(true)
+    const rel = await rpc('release', { sessionId: 's6', text: '   ' })
+    expect(rel.value).toMatchObject({ released: false, delivered: false })
+    expect(h.steered).toHaveLength(0)
   })
 
-  it('没有暂停点但在跑时把插话排进队列，下一个暂停点自动并入', async () => {
+  it('没有暂停点时立即 steer，不排队', async () => {
     const h = harness(true)
-    h.status('s6', 'running')
-    const queued = await rpc('release', { sessionId: 's6', text: ' 赶在暂停点前面 ' })
-    expect(queued.value).toMatchObject({ released: false, busy: true, queued: true })
-    expect((await rpc('status', { sessionId: 's6' })).value.pendingMessageCount).toBe(1)
-
-    // 暂停点还没挂上时不必再按回车：这一步会直接带走队列里的消息。
-    const p = h.preStep(
-      { agent: { id: 's6' }, turn: 1, step: 2, signal: new AbortController().signal, messages: [] },
-      async () => ({ kind: 'enter', messages: [] }),
-    )
-    const decision = await p
-    expect(decision.messages).toHaveLength(1)
-    expect(decision.messages[0].content).toMatchObject([{ type: 'text', text: '赶在暂停点前面' }])
-    expect((await rpc('status', { sessionId: 's6' })).value.pendingMessageCount).toBe(0)
+    const rel = await rpc('release', { sessionId: 's7', text: ' 立刻发 ' })
+    expect(rel.value).toMatchObject({ released: false, delivered: true })
+    expect(h.steered).toHaveLength(1)
+    expect(h.steered[0]!.sessionId).toBe('s7')
+    expect(h.steered[0]!.message.content).toMatchObject([{ type: 'text', text: '立刻发' }])
   })
 
-  it('没有暂停点且在跑时空回车不排队', async () => {
-    const h = harness(true)
-    h.status('s7', 'running')
-    const rel = await rpc('release', { sessionId: 's7', text: '' })
-    expect(rel.value).toMatchObject({ released: false, busy: true, queued: false })
-    expect((await rpc('status', { sessionId: 's7' })).value.pendingMessageCount).toBe(0)
+  it('没有暂停点且没有活 agent 时返回未送达', async () => {
+    harness(true, false)
+    const rel = await rpc('release', { sessionId: 's8', text: '先别丢' })
+    expect(rel.value).toMatchObject({ released: false, delivered: false })
   })
 
-  it('turn 结束时排队的插话由 followup 当场发出', async () => {
-    const h = harness(true)
-    h.status('s8', 'running')
-    await rpc('release', { sessionId: 's8', text: '没赶上' })
-    expect(h.followed).toHaveLength(0)
-    h.status('s8', 'idle')
-    await Promise.resolve()
-    expect(h.followed).toHaveLength(1)
-    expect(h.followed[0]!.sessionId).toBe('s8')
-    expect(h.followed[0]!.message.content).toMatchObject([{ type: 'text', text: '没赶上' }])
-    expect((await rpc('status', { sessionId: 's8' })).value.pendingMessageCount).toBe(0)
-  })
-
-  it('插话已被下一个暂停点带走时 idle 不再重复 followup', async () => {
-    const h = harness(true)
-    h.status('s9', 'running')
-    await rpc('release', { sessionId: 's9', text: '插一句' })
+  it('pre-step 记住的 agent 在没有 agents 服务时也能立即 steer', async () => {
+    const h = harness(true, false)
     await h.preStep(
-      { agent: { id: 's9' }, turn: 1, step: 2, signal: new AbortController().signal, messages: [] },
+      { agent: { id: 's12' }, turn: 1, step: 1, signal: new AbortController().signal, messages: [] },
       async () => ({ kind: 'enter', messages: [] }),
     )
-    h.status('s9', 'idle')
+    const rel = await rpc('release', { sessionId: 's12', text: '还能发' })
+    expect(rel.value).toMatchObject({ released: false, delivered: true })
+    expect(h.steered).toHaveLength(1)
+    expect(h.steered[0]!.message.content).toMatchObject([{ type: 'text', text: '还能发' }])
+  })
+
+  it('插话已被认领进本步时不再挂暂停点', async () => {
+    const h = harness(true)
+    const rel = await rpc('release', { sessionId: 's20', text: '插一句' })
+    expect(rel.value.delivered).toBe(true)
+    const message = h.steered[0]!.message
+    const decision = await h.preStep(
+      { agent: { id: 's20' }, turn: 1, step: 2, signal: new AbortController().signal, messages: [message] },
+      async () => ({ kind: 'enter', messages: [] }),
+    )
+    expect(decision).toEqual({ kind: 'enter', messages: [] })
+  })
+
+  it('插话没进本步时照常暂停', async () => {
+    const h = harness(true)
+    await rpc('release', { sessionId: 's21', text: '插一句' })
+    const base = { kind: 'enter' as const, messages: [] }
+    const p = h.preStep(
+      { agent: { id: 's21' }, turn: 1, step: 2, signal: new AbortController().signal, messages: [] },
+      async () => base,
+    )
     await Promise.resolve()
-    expect(h.followed).toHaveLength(0)
+    expect((await rpc('status', { sessionId: 's21' })).value.paused).toBe(true)
+    await rpc('release', { sessionId: 's21', text: '' })
+    await expect(p).resolves.toEqual(base)
   })
 
-  it('没有暂停点、空闲且尚无 agent 引用时返回未送达，不入队', async () => {
-    const h = harness(true)
-    const rel = await rpc('release', { sessionId: 's10', text: '先别丢' })
-    expect(rel.value).toMatchObject({ released: false, busy: false, queued: false })
-    expect((await rpc('status', { sessionId: 's10' })).value.pendingMessageCount).toBe(0)
-  })
-
-  it('没有暂停点、空闲且已有 agent 引用时 release 直接 followup', async () => {
-    const h = harness(true)
-    h.status('s12', 'idle')
-    const rel = await rpc('release', { sessionId: 's12', text: '直接发' })
-    expect(rel.value).toMatchObject({ released: false, busy: false, queued: true })
-    expect(h.followed).toHaveLength(1)
-    expect(h.followed[0]!.message.content).toMatchObject([{ type: 'text', text: '直接发' }])
-  })
-
-  it('暂停点放行后该步 reject，插话放回队列并在 idle 补发', async () => {
+  it('暂停点放行后该步 reject 时重新 steer', async () => {
     const h = harness(true)
     const p = h.preStep(
-      { agent: { id: 's13' }, turn: 1, step: 2, signal: new AbortController().signal, messages: [] },
+      { agent: { id: 's9' }, turn: 1, step: 2, signal: new AbortController().signal, messages: [] },
       async () => ({ kind: 'reject' as const }),
     )
     await Promise.resolve()
-    await rpc('release', { sessionId: 's13', text: '别丢' })
+    await rpc('release', { sessionId: 's9', text: '别丢' })
     await expect(p).resolves.toEqual({ kind: 'reject' })
-    expect((await rpc('status', { sessionId: 's13' })).value.pendingMessageCount).toBe(1)
-    h.status('s13', 'idle')
-    await Promise.resolve()
-    expect(h.followed).toHaveLength(1)
-    expect(h.followed[0]!.message.content).toMatchObject([{ type: 'text', text: '别丢' }])
+    expect(h.steered).toHaveLength(1)
+    expect(h.steered[0]!.message.content).toMatchObject([{ type: 'text', text: '别丢' }])
   })
 
-  it('预放行时 next 抛错，队列放回', async () => {
-    const h = harness(true)
-    h.status('s14', 'running')
-    await rpc('release', { sessionId: 's14', text: '放回' })
-    await expect(h.preStep(
-      { agent: { id: 's14' }, turn: 1, step: 2, signal: new AbortController().signal, messages: [] },
-      async () => { throw new Error('driver failed') },
-    )).rejects.toThrow('driver failed')
-    expect((await rpc('status', { sessionId: 's14' })).value.pendingMessageCount).toBe(1)
+  it('该步 reject 且没有活 agent 时写错误日志', async () => {
+    const h = harness(true, false, false)
+    const errors: unknown[][] = []
+    const original = console.error
+    console.error = (...args: unknown[]) => { errors.push(args) }
+    try {
+      const p = h.preStep(
+        { agent: { id: 's10' }, turn: 1, step: 2, signal: new AbortController().signal, messages: [] },
+        async () => ({ kind: 'reject' as const }),
+      )
+      await Promise.resolve()
+      await rpc('release', { sessionId: 's10', text: '会丢' })
+      await expect(p).resolves.toEqual({ kind: 'reject' })
+    } finally {
+      console.error = original
+    }
+    expect(errors).toHaveLength(1)
   })
 
-  it('idle 补发失败时插话放回队列，下一次派发再试', async () => {
+  it('steer 抛错时 RPC 返回错误，草稿由客户端保留', async () => {
     const h = harness(true)
-    h.status('s15', 'running')
-    await rpc('release', { sessionId: 's15', text: '重试' })
-    h.status('s15', 'idle', true)
-    await Promise.resolve()
-    expect((await rpc('status', { sessionId: 's15' })).value.pendingMessageCount).toBe(1)
-    h.status('s15', 'idle')
-    await Promise.resolve()
-    expect(h.followed).toHaveLength(1)
-    expect(h.followed[0]!.message.content).toMatchObject([{ type: 'text', text: '重试' }])
-  })
-
-  it('空闲状态重复推送时待发队列只补发一次', async () => {
-    const h = harness(true)
-    h.status('s11', 'running')
-    await rpc('release', { sessionId: 's11', text: '只发一次' })
-    h.status('s11', 'idle')
-    await Promise.resolve()
-    h.status('s11', 'idle')
-    await Promise.resolve()
-    expect(h.followed).toHaveLength(1)
+    h.setSteerThrows(true)
+    const rel = await rpc('release', { sessionId: 's11', text: '发不出去' })
+    expect(rel.ok).toBe(false)
   })
 
   it('RPC 参数校验返回 error', async () => {
