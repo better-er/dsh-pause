@@ -24,8 +24,6 @@ declare module '@deepseek-ai/cordis' {
   interface Events {
     'agent/pre-step'(this: never, payload: PreStepPayload, next: () => Promise<PreStepDecision>): Promise<PreStepDecision>
     'agent/status'(this: never, payload: AgentStatusPayload): void
-    'agent/inbox/claimed'(this: never, payload: InboxEventPayload): void
-    'agent/inbox/discarded'(this: never, payload: InboxEventPayload): void
   }
 }
 
@@ -46,9 +44,13 @@ interface PreStepPayload {
 }
 type PreStepDecision = { kind: 'reject' } | { kind: 'enter'; messages: UserMessage[]; startsRequestSeries?: true }
 
-/** agent 的插话入口：steer 在最近一步认领，空闲时自己开新 turn。 */
+/** agent 的插话入口：steer 在最近一步认领，空闲时自己开新 turn。inbox 用来判断插话是否还在等认领。 */
 interface AgentFace {
   steer(message: UserMessage): void
+  readonly inbox: {
+    readonly nextStep: readonly UserMessage[]
+    readonly nextTurn: readonly UserMessage[]
+  }
 }
 
 /** 活 agent 注册表的最小面。 */
@@ -60,12 +62,6 @@ interface AgentRegistryFace {
 interface AgentStatusPayload {
   agent: AgentFace & { id: string }
   status: 'idle' | 'running'
-}
-
-/** inbox 认领与丢弃事件的载荷。 */
-interface InboxEventPayload {
-  agent: AgentFace & { id: string }
-  message: UserMessage
 }
 
 /** 浏览器可随插话提交的图片媒体类型，与附件服务的准入集合一致。 */
@@ -169,10 +165,8 @@ export function apply(ctx: Context, config: Config = {}): void {
   const agentFor = (sessionId: string): AgentFace | undefined =>
     liveAgents.get(sessionId) ?? agentRegistry(ctx)?.get(sessionId)
 
-  // 已 steer、还没被 dsh 认领的插话 id；以及刚被认领、还没随某步走完的插话 id。
-  // 两种状态都说明用户已经插过话：先让插话送达，暂停等送达后再恢复。
+  // 已 steer、还没被认领的插话 id。插话送达前暂停先不生效。
   const pendingSteer = new Map<string, Set<string>>()
-  const claimedSteer = new Map<string, Set<string>>()
   const markSteer = (sessionId: string, message: UserMessage): void => {
     let ids = pendingSteer.get(sessionId)
     if (ids === undefined) {
@@ -180,6 +174,22 @@ export function apply(ctx: Context, config: Config = {}): void {
       pendingSteer.set(sessionId, ids)
     }
     ids.add(message.id)
+  }
+
+  /** 清掉已经不在 inbox、也没随本步进来的插话，避免暂停被永久放过。 */
+  const pruneSteer = (sessionId: string, messages: readonly UserMessage[]): Set<string> | undefined => {
+    const pending = pendingSteer.get(sessionId)
+    if (pending === undefined || pending.size === 0) return undefined
+    const agent = agentFor(sessionId)
+    // 拿不到 agent 时无法判断插话是否还在，保守地继续放过。
+    if (agent === undefined) return pending
+    const inBatch = new Set(messages.map((message) => String(message.id)))
+    const inboxIds = new Set(agent.inbox.nextStep.map((message) => String(message.id)))
+    for (const id of [...pending]) {
+      if (inBatch.has(id)) { pending.delete(id); continue }
+      if (!inboxIds.has(id)) pending.delete(id)
+    }
+    return pending.size > 0 ? pending : undefined
   }
 
   /** 该步被 reject 时把已并入的消息重新 steer 一次，避免插件缓存或丢失。 */
@@ -253,38 +263,21 @@ export function apply(ctx: Context, config: Config = {}): void {
     liveAgents.set(payload.agent.id, payload.agent)
   })
 
-  ctx.on('agent/inbox/claimed', (payload: InboxEventPayload) => {
-    const sessionId = payload.agent.id
-    if (pendingSteer.get(sessionId)?.delete(payload.message.id) !== true) return
-    let ids = claimedSteer.get(sessionId)
-    if (ids === undefined) {
-      ids = new Set()
-      claimedSteer.set(sessionId, ids)
-    }
-    ids.add(payload.message.id)
-  })
-
-  ctx.on('agent/inbox/discarded', (payload: InboxEventPayload) => {
-    const sessionId = payload.agent.id
-    pendingSteer.get(sessionId)?.delete(payload.message.id)
-    claimedSteer.get(sessionId)?.delete(payload.message.id)
-  })
-
   ctx.on('agent/pre-step', async (payload: PreStepPayload, next: () => Promise<PreStepDecision>) => {
     const sessionId = payload.agent.id
     liveAgents.set(sessionId, payload.agent)
     const state = registry.stateFor(sessionId)
-    // 认领后紧跟的这一步就是带插话的一步：先放行，开启暂停时也不拦它。
-    const claimed = claimedSteer.get(sessionId)
-    if (claimed !== undefined && claimed.size > 0) {
-      claimed.clear()
-      return next()
-    }
     if (payload.step <= 1 || !state.enabled) return next()
 
     // 插话还在 inbox 里等认领：先让流程走到带插话的那一步，暂停暂不生效。
-    const pending = pendingSteer.get(sessionId)
-    if (pending !== undefined && pending.size > 0) return next()
+    if (pruneSteer(sessionId, payload.messages) !== undefined) return next()
+
+    // 本步已领取到用户消息，说明是插话触发的这一步，不管来源都放行。
+    if (payload.messages.length > 0) return next()
+
+    // 队列里还有等下一轮的用户消息：已经插过话，这一轮先不再停。
+    const inbox = agentFor(sessionId)?.inbox
+    if (inbox !== undefined && inbox.nextTurn.length > 0) return next()
 
     let resolvePausePoint: (message: UserMessage | undefined) => void = () => {}
     let rejectPausePoint: (reason: unknown) => void = () => {}

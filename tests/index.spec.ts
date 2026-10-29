@@ -54,8 +54,6 @@ function fakeAttachments() {
 function harness(enabledDefault = false, withAgents = true, withAgentPayload = true) {
   let preStepListener: PreStepListener | undefined
   let statusListener: ((payload: any) => void) | undefined
-  let claimedListener: ((payload: any) => void) | undefined
-  let discardedListener: ((payload: any) => void) | undefined
   const scope = {
     connection: { requestRejection: () => undefined },
     webServer: {
@@ -69,11 +67,27 @@ function harness(enabledDefault = false, withAgents = true, withAgentPayload = t
   const attachments = fakeAttachments()
   const steered: { sessionId: string; message: any }[] = []
   let steerThrows = false
+  const inboxes = new Map<string, { nextStep: any[]; nextTurn: any[] }>()
+  const inboxOf = (id: string) => {
+    let inbox = inboxes.get(id)
+    if (inbox === undefined) {
+      inbox = { nextStep: [], nextTurn: [] }
+      inboxes.set(id, inbox)
+    }
+    return inbox
+  }
+  const takeFromInbox = (id: string, message: any) => {
+    const inbox = inboxOf(id)
+    const index = inbox.nextStep.findIndex((item) => item.id === message.id)
+    if (index >= 0) inbox.nextStep.splice(index, 1)
+  }
   const agentOf = (id: string) => ({
     id,
+    inbox: inboxOf(id),
     steer(message: any) {
       if (steerThrows) throw new Error('steer failed')
       steered.push({ sessionId: id, message })
+      inboxOf(id).nextStep.push(message)
     },
   })
   const agents = { get: (sessionId: string) => agentOf(sessionId) }
@@ -81,8 +95,6 @@ function harness(enabledDefault = false, withAgents = true, withAgentPayload = t
     on(_name: string, listener: any) {
       if (_name === 'agent/pre-step') preStepListener = listener as PreStepListener
       if (_name === 'agent/status') statusListener = listener as (payload: any) => void
-      if (_name === 'agent/inbox/claimed') claimedListener = listener as (payload: any) => void
-      if (_name === 'agent/inbox/discarded') discardedListener = listener as (payload: any) => void
       return () => true
     },
     inject(_deps: string[], cb: (s: unknown) => void) { cb(scope) },
@@ -99,8 +111,9 @@ function harness(enabledDefault = false, withAgents = true, withAgentPayload = t
       return preStepListener!({ ...payload, agent }, next)
     },
     status(payload: any) { statusListener!(payload) },
-    claim(sessionId: string, message: any) { claimedListener!({ agent: agentOf(sessionId), message }) },
-    discard(sessionId: string, message: any) { discardedListener!({ agent: agentOf(sessionId), message }) },
+    claim(sessionId: string, message: any) { takeFromInbox(sessionId, message) },
+    discard(sessionId: string, message: any) { takeFromInbox(sessionId, message) },
+    enqueueTurn(sessionId: string, message: any) { inboxOf(sessionId).nextTurn.push(message) },
     steered,
     setSteerThrows(value: boolean) { steerThrows = value },
     attachments,
@@ -264,7 +277,17 @@ describe('apply host wiring', () => {
     const message = h.steered[0]!.message
     h.claim('s21', message)
     const decision = await h.preStep(
-      { agent: { id: 's21' }, turn: 1, step: 2, signal: new AbortController().signal, messages: [] },
+      { agent: { id: 's21' }, turn: 1, step: 2, signal: new AbortController().signal, messages: [message] },
+      async () => ({ kind: 'enter', messages: [] }),
+    )
+    expect(decision).toEqual({ kind: 'enter', messages: [] })
+  })
+
+  it('下一轮队列里已有消息时这一轮也不再暂停', async () => {
+    const h = harness(true)
+    h.enqueueTurn('s23', { id: 'm1', role: 'user', content: [] })
+    const decision = await h.preStep(
+      { agent: { id: 's23' }, turn: 1, step: 2, signal: new AbortController().signal, messages: [] },
       async () => ({ kind: 'enter', messages: [] }),
     )
     expect(decision).toEqual({ kind: 'enter', messages: [] })
