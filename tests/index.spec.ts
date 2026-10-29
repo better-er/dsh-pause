@@ -54,6 +54,8 @@ function fakeAttachments() {
 function harness(enabledDefault = false, withAgents = true, withAgentPayload = true) {
   let preStepListener: PreStepListener | undefined
   let statusListener: ((payload: any) => void) | undefined
+  let claimedListener: ((payload: any) => void) | undefined
+  let discardedListener: ((payload: any) => void) | undefined
   const scope = {
     connection: { requestRejection: () => undefined },
     webServer: {
@@ -79,6 +81,8 @@ function harness(enabledDefault = false, withAgents = true, withAgentPayload = t
     on(_name: string, listener: any) {
       if (_name === 'agent/pre-step') preStepListener = listener as PreStepListener
       if (_name === 'agent/status') statusListener = listener as (payload: any) => void
+      if (_name === 'agent/inbox/claimed') claimedListener = listener as (payload: any) => void
+      if (_name === 'agent/inbox/discarded') discardedListener = listener as (payload: any) => void
       return () => true
     },
     inject(_deps: string[], cb: (s: unknown) => void) { cb(scope) },
@@ -95,6 +99,8 @@ function harness(enabledDefault = false, withAgents = true, withAgentPayload = t
       return preStepListener!({ ...payload, agent }, next)
     },
     status(payload: any) { statusListener!(payload) },
+    claim(sessionId: string, message: any) { claimedListener!({ agent: agentOf(sessionId), message }) },
+    discard(sessionId: string, message: any) { discardedListener!({ agent: agentOf(sessionId), message }) },
     steered,
     setSteerThrows(value: boolean) { steerThrows = value },
     attachments,
@@ -242,29 +248,40 @@ describe('apply host wiring', () => {
     expect(h.steered[0]!.message.content).toMatchObject([{ type: 'text', text: '还能发' }])
   })
 
-  it('插话已被认领进本步时不再挂暂停点', async () => {
+  it('插话未认领时开启暂停也不暂停', async () => {
     const h = harness(true)
-    const rel = await rpc('release', { sessionId: 's20', text: '插一句' })
-    expect(rel.value.delivered).toBe(true)
-    const message = h.steered[0]!.message
+    await rpc('release', { sessionId: 's20', text: '插一句' })
     const decision = await h.preStep(
-      { agent: { id: 's20' }, turn: 1, step: 2, signal: new AbortController().signal, messages: [message] },
+      { agent: { id: 's20' }, turn: 1, step: 2, signal: new AbortController().signal, messages: [] },
       async () => ({ kind: 'enter', messages: [] }),
     )
     expect(decision).toEqual({ kind: 'enter', messages: [] })
   })
 
-  it('插话没进本步时照常暂停', async () => {
+  it('插话刚被认领时打开暂停仍放行该步', async () => {
     const h = harness(true)
     await rpc('release', { sessionId: 's21', text: '插一句' })
+    const message = h.steered[0]!.message
+    h.claim('s21', message)
+    const decision = await h.preStep(
+      { agent: { id: 's21' }, turn: 1, step: 2, signal: new AbortController().signal, messages: [] },
+      async () => ({ kind: 'enter', messages: [] }),
+    )
+    expect(decision).toEqual({ kind: 'enter', messages: [] })
+  })
+
+  it('插话被丢弃后恢复暂停', async () => {
+    const h = harness(true)
+    await rpc('release', { sessionId: 's22', text: '插一句' })
+    h.discard('s22', h.steered[0]!.message)
     const base = { kind: 'enter' as const, messages: [] }
     const p = h.preStep(
-      { agent: { id: 's21' }, turn: 1, step: 2, signal: new AbortController().signal, messages: [] },
+      { agent: { id: 's22' }, turn: 1, step: 2, signal: new AbortController().signal, messages: [] },
       async () => base,
     )
     await Promise.resolve()
-    expect((await rpc('status', { sessionId: 's21' })).value.paused).toBe(true)
-    await rpc('release', { sessionId: 's21', text: '' })
+    expect((await rpc('status', { sessionId: 's22' })).value.paused).toBe(true)
+    await rpc('release', { sessionId: 's22', text: '' })
     await expect(p).resolves.toEqual(base)
   })
 

@@ -24,6 +24,8 @@ declare module '@deepseek-ai/cordis' {
   interface Events {
     'agent/pre-step'(this: never, payload: PreStepPayload, next: () => Promise<PreStepDecision>): Promise<PreStepDecision>
     'agent/status'(this: never, payload: AgentStatusPayload): void
+    'agent/inbox/claimed'(this: never, payload: InboxEventPayload): void
+    'agent/inbox/discarded'(this: never, payload: InboxEventPayload): void
   }
 }
 
@@ -58,6 +60,12 @@ interface AgentRegistryFace {
 interface AgentStatusPayload {
   agent: AgentFace & { id: string }
   status: 'idle' | 'running'
+}
+
+/** inbox 认领与丢弃事件的载荷。 */
+interface InboxEventPayload {
+  agent: AgentFace & { id: string }
+  message: UserMessage
 }
 
 /** 浏览器可随插话提交的图片媒体类型，与附件服务的准入集合一致。 */
@@ -161,13 +169,15 @@ export function apply(ctx: Context, config: Config = {}): void {
   const agentFor = (sessionId: string): AgentFace | undefined =>
     liveAgents.get(sessionId) ?? agentRegistry(ctx)?.get(sessionId)
 
-  // 刚 steer 出去、还没被认领进某一步的插话 id。pre-step 命中说明这条插话就在本步里，不必再停。
-  const awaitingSteer = new Map<string, Set<string>>()
+  // 已 steer、还没被 dsh 认领的插话 id；以及刚被认领、还没随某步走完的插话 id。
+  // 两种状态都说明用户已经插过话：先让插话送达，暂停等送达后再恢复。
+  const pendingSteer = new Map<string, Set<string>>()
+  const claimedSteer = new Map<string, Set<string>>()
   const markSteer = (sessionId: string, message: UserMessage): void => {
-    let ids = awaitingSteer.get(sessionId)
+    let ids = pendingSteer.get(sessionId)
     if (ids === undefined) {
       ids = new Set()
-      awaitingSteer.set(sessionId, ids)
+      pendingSteer.set(sessionId, ids)
     }
     ids.add(message.id)
   }
@@ -241,24 +251,40 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   ctx.on('agent/status', (payload: AgentStatusPayload) => {
     liveAgents.set(payload.agent.id, payload.agent)
-    if (payload.status === 'idle') awaitingSteer.delete(payload.agent.id)
+  })
+
+  ctx.on('agent/inbox/claimed', (payload: InboxEventPayload) => {
+    const sessionId = payload.agent.id
+    if (pendingSteer.get(sessionId)?.delete(payload.message.id) !== true) return
+    let ids = claimedSteer.get(sessionId)
+    if (ids === undefined) {
+      ids = new Set()
+      claimedSteer.set(sessionId, ids)
+    }
+    ids.add(payload.message.id)
+  })
+
+  ctx.on('agent/inbox/discarded', (payload: InboxEventPayload) => {
+    const sessionId = payload.agent.id
+    pendingSteer.get(sessionId)?.delete(payload.message.id)
+    claimedSteer.get(sessionId)?.delete(payload.message.id)
   })
 
   ctx.on('agent/pre-step', async (payload: PreStepPayload, next: () => Promise<PreStepDecision>) => {
     const sessionId = payload.agent.id
     liveAgents.set(sessionId, payload.agent)
     const state = registry.stateFor(sessionId)
+    // 认领后紧跟的这一步就是带插话的一步：先放行，开启暂停时也不拦它。
+    const claimed = claimedSteer.get(sessionId)
+    if (claimed !== undefined && claimed.size > 0) {
+      claimed.clear()
+      return next()
+    }
     if (payload.step <= 1 || !state.enabled) return next()
 
-    // 插话已被认领进本步：按回车就是让模型继续，这次不再停。
-    const pendingSteer = awaitingSteer.get(sessionId)
-    if (pendingSteer !== undefined && pendingSteer.size > 0) {
-      let matched = false
-      for (const message of payload.messages) {
-        if (pendingSteer.delete(message.id)) matched = true
-      }
-      if (matched) return next()
-    }
+    // 插话还在 inbox 里等认领：先让流程走到带插话的那一步，暂停暂不生效。
+    const pending = pendingSteer.get(sessionId)
+    if (pending !== undefined && pending.size > 0) return next()
 
     let resolvePausePoint: (message: UserMessage | undefined) => void = () => {}
     let rejectPausePoint: (reason: unknown) => void = () => {}
