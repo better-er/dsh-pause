@@ -1,3 +1,19 @@
+/**
+ * dsh-pause 主机半身：暂停控制器与判定。
+ *
+ * 核心语义：在 agent 每轮 step 进入前的 agent/pre-step 事件里判断这次请求是否为工具交互后的续跑。
+ * 若是续跑且开关开启，则挂起一个暂停点，等人类经 release 原语放行后才把这一次请求发出去。
+ * 放行时可带补充文字，作为一条 user 消息并入本 step 的 messages，让模型在紧接着的请求里看到它。
+ *
+ * 暂停点只卡在请求真正发出之前，因此不打断任何在途 API 调用。
+ * 暂停点还没挂上时按回车发出的插话一律立即交给 agent.steer()，由 dsh 在最近一步认领；空闲时 steer 自己开新 turn。
+ * 插件不缓存插话，也不做补发；只有该步被 reject 时把已并入的消息重新 steer 一次，失败写日志。
+ * 已经插过话时不再拦这一步：本步已领取批次带用户消息、插话还在 inbox、或下一轮队列已有消息，都直接放行。
+ * driver 组装好的上下文原样放行，不插入、不删除、不改写任何模型可见的痕迹，模型无感知暂停。
+ *
+ * @module dsh-pause
+ */
+
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm'
@@ -14,14 +30,14 @@ declare module '@deepseek-ai/cordis' {
 
 export const name = 'dsh-pause'
 
-/** 本插件需要的主机服务。connection 是 host 与浏览器共享的 RPC 载体。 */
-export const inject = ['connection']
+/** 本插件需要的主机服务。connection 是 host 与浏览器共享的 RPC 载体，agents 用来把插话 steer 进当前 turn。 */
+export const inject = ['connection', 'agents']
 
 export interface Config { defaultEnabled?: boolean }
 export const Config: z<Config> = z.object({ defaultEnabled: z.boolean().default(DEFAULT_ENABLED) })
 
 interface PreStepPayload {
-  agent: { id: string }
+  agent: AgentFace & { id: string }
   turn: number
   step: number
   signal: AbortSignal
@@ -29,10 +45,23 @@ interface PreStepPayload {
 }
 type PreStepDecision = { kind: 'reject' } | { kind: 'enter'; messages: UserMessage[]; startsRequestSeries?: true }
 
-/** agent/status 只报 idle 与 running 两个值，用来判断 turn 是否还可能挂下一个暂停点。 */
+/** agent 的插话入口：steer 在最近一步认领，空闲时自己开新 turn。inbox 用来判断插话是否还在等认领。 */
+interface AgentFace {
+  steer(message: UserMessage): void
+  readonly inbox: {
+    readonly nextStep: readonly UserMessage[]
+    readonly nextTurn: readonly UserMessage[]
+  }
+}
+
+/** 活 agent 注册表的最小面。 */
+interface AgentRegistryFace {
+  get(sessionId: string): AgentFace | undefined
+}
+
+/** agent/status 的载荷，带的 agent 可直接 steer。 */
 interface AgentStatusPayload {
-  /** followup 用于把 turn 结束时还没送出的插话当场发出去。 */
-  agent: { id: string; followup(message: UserMessage): void }
+  agent: AgentFace & { id: string }
   status: 'idle' | 'running'
 }
 
@@ -68,6 +97,16 @@ interface StatusBody { sessionId?: unknown }
 function ok(value: unknown): RpcChannelResult { return { ok: true, value } }
 function rpcError(message: string): RpcChannelResult {
   return { ok: false, error: { code: 'internal', message, details: {} } }
+}
+
+/** 读取活 agent 注册表，用于把插话立即 steer 进当前 turn。 */
+function agentRegistry(ctx: Context): AgentRegistryFace | undefined {
+  const get = (ctx as unknown as { get?: (name: string, strict?: boolean) => unknown }).get
+  if (typeof get === 'function') {
+    const service = get.call(ctx, 'agents', false) as AgentRegistryFace | undefined
+    if (service !== undefined) return service
+  }
+  return (ctx as unknown as { agents?: AgentRegistryFace }).agents
 }
 
 /** 读取附件服务。RPC 测试桩或裁剪运行环境可能没有它，此时带图插话会明确报错。 */
@@ -122,8 +161,52 @@ export function apply(ctx: Context, config: Config = {}): void {
   const defaultEnabled = config.defaultEnabled === true
   const registry = new PauseRegistry(defaultEnabled)
 
-  // 记住每个 agent 的活引用，空闲时按回车可以把插话直接 followup 成新 turn。
-  const agents = new Map<string, AgentStatusPayload['agent']>()
+  // 插话要立即 steer，所以得拿到活 agent。热加载或时序原因可能读不到 agents 服务，pre-step 与 status 的载荷都带活 agent，一并记住。
+  const liveAgents = new Map<string, AgentFace>()
+  const agentFor = (sessionId: string): AgentFace | undefined =>
+    liveAgents.get(sessionId) ?? agentRegistry(ctx)?.get(sessionId)
+
+  // 已 steer、还没被认领的插话 id。插话送达前暂停先不生效。
+  const pendingSteer = new Map<string, Set<string>>()
+  const markSteer = (sessionId: string, message: UserMessage): void => {
+    let ids = pendingSteer.get(sessionId)
+    if (ids === undefined) {
+      ids = new Set()
+      pendingSteer.set(sessionId, ids)
+    }
+    ids.add(message.id)
+  }
+
+  /** 清掉已经不在 inbox、也没随本步进来的插话，避免暂停被永久放过。 */
+  const pruneSteer = (sessionId: string, messages: readonly UserMessage[]): Set<string> | undefined => {
+    const pending = pendingSteer.get(sessionId)
+    if (pending === undefined || pending.size === 0) return undefined
+    const agent = agentFor(sessionId)
+    // 拿不到 agent 时无法判断插话是否还在，保守地继续放过。
+    if (agent === undefined) return pending
+    const inBatch = new Set(messages.map((message) => String(message.id)))
+    const inboxIds = new Set(agent.inbox.nextStep.map((message) => String(message.id)))
+    for (const id of [...pending]) {
+      if (inBatch.has(id)) { pending.delete(id); continue }
+      if (!inboxIds.has(id)) pending.delete(id)
+    }
+    return pending.size > 0 ? pending : undefined
+  }
+
+  /** 该步被 reject 时把已并入的消息重新 steer 一次，避免插件缓存或丢失。 */
+  const resteer = (sessionId: string, message: UserMessage): void => {
+    const agent = agentFor(sessionId)
+    if (agent === undefined) {
+      console.error('[dsh-pause] 该步已 reject，且没有活 agent 可重新 steer，插话丢失：', message)
+      return
+    }
+    try {
+      agent.steer(message)
+      markSteer(sessionId, message)
+    } catch (error) {
+      console.error('[dsh-pause] 该步已 reject，重新 steer 失败，插话丢失：', error)
+    }
+  }
 
   const handler: RpcChannelHandler = async (endpoint, payload) => {
     try {
@@ -139,34 +222,26 @@ export function apply(ctx: Context, config: Config = {}): void {
         case 'release': {
           const { sessionId, text, images } = payload as ReleaseBody
           if (typeof sessionId !== 'string') return rpcError('release requires sessionId:string')
-          const paused = registry.isPaused(sessionId)
           const textLength = typeof text === 'string' ? text.trim().length : 0
           const imageCount = Array.isArray(images) ? images.length : 0
-          if (!paused) {
-            // 没有暂停点时由 agent 是否在跑来裁决：还在跑说明下一个暂停点会来，消息先排队；
-            // 已经空闲则不会再有暂停点，有 agent 活引用就直接 followup 开一条新 turn。
-            if (textLength === 0 && imageCount === 0) {
-              return ok({ released: false, busy: registry.isBusy(sessionId), queued: false })
-            }
-            const message = await buildReleaseMessage(ctx, text, images)
-            if (message === undefined) return ok({ released: false, busy: registry.isBusy(sessionId), queued: false })
-            // 构建消息期间 turn 可能已经结束，这种时候直接 followup 开新 turn。
-            if (!registry.isBusy(sessionId)) {
-              const agent = agents.get(sessionId)
-              if (agent !== undefined) {
-                // 没有暂停点也不会再有：按了就发出去，直接开一条新 turn。
-                agent.followup(message)
-                return ok({ released: false, busy: false, queued: true })
-              }
-              // 没有 agent 活引用，主机现在发不出去。不静默入队，交回客户端暂存，下次按回车再试。
-              return ok({ released: false, busy: false, queued: false })
-            }
-            registry.queueMessage(sessionId, message)
-            return ok({ released: false, busy: true, queued: true })
+          const message = textLength === 0 && imageCount === 0
+            ? undefined
+            : await buildReleaseMessage(ctx, text, images)
+          // 暂停点挂着时放行并把消息并入本步，请求立刻发出。
+          if (registry.isPaused(sessionId)) {
+            const released = registry.release(sessionId, message)
+            return ok({ released, delivered: message !== undefined })
           }
-          const message = await buildReleaseMessage(ctx, text, images)
-          const released = registry.release(sessionId, message)
-          return ok({ released, busy: registry.isBusy(sessionId), queued: false })
+          if (message === undefined) return ok({ released: false, delivered: false })
+          // 没有暂停点就立即 steer，不缓存；空闲时 steer 自己开新 turn。
+          const agent = agentFor(sessionId)
+          if (agent === undefined) {
+            console.error('[dsh-pause] 找不到活 agent，无法 steer 插话：', sessionId)
+            return ok({ released: false, delivered: false })
+          }
+          agent.steer(message)
+          markSteer(sessionId, message)
+          return ok({ released: false, delivered: true })
         }
         case 'status': {
           const { sessionId } = payload as StatusBody
@@ -174,8 +249,6 @@ export function apply(ctx: Context, config: Config = {}): void {
           return ok({
             enabled: registry.enabled(sessionId),
             paused: registry.isPaused(sessionId),
-            busy: registry.isBusy(sessionId),
-            pendingMessageCount: registry.pendingMessageCount(sessionId),
           })
         }
         default: return rpcError('unknown endpoint ' + endpoint)
@@ -187,54 +260,25 @@ export function apply(ctx: Context, config: Config = {}): void {
   // connection.rpc.handle 自 0.1.2-rc.1 起即不可用，登记路由时解析 webServer 会抛 without inject，故改为插件自注册通道。
   mountRpcChannel(ctx, '/dsh-pause', handler)
 
-  // agent/status 是判断「暂停点还会不会来」的唯一依据：running 时下一个迟早挂上，idle 时永远不会。
   ctx.on('agent/status', (payload: AgentStatusPayload) => {
-    const sessionId = payload.agent.id
-    agents.set(sessionId, payload.agent)
-    const busy = payload.status === 'running'
-    if (registry.isBusy(sessionId) !== busy) registry.setBusy(sessionId, busy)
-    if (busy) return
-    // turn 已经结束，排队的插话等不到暂停点了。按了回车就一定发出去：直接 followup 开一条新 turn。
-    // 不因 busy 未变而提前返回：队列里可能有暂停点该步被 reject 时放回的消息，要借这次派发再试。
-    const leftover = registry.takePendingMessages(sessionId)
-    if (leftover.length === 0) return
-    // 让本次 status 派发先结束，避免 followup 唤醒 driver 时重入同一个事件。
-    queueMicrotask(() => {
-      const failed: UserMessage[] = []
-      for (const message of leftover) {
-        try {
-          payload.agent.followup(message)
-        } catch {
-          failed.push(message)
-        }
-      }
-      // 补发失败时放回队列，等下一次状态派发或暂停点再试。
-      if (failed.length > 0) registry.requeueMessages(sessionId, failed)
-    })
+    liveAgents.set(payload.agent.id, payload.agent)
   })
 
   ctx.on('agent/pre-step', async (payload: PreStepPayload, next: () => Promise<PreStepDecision>) => {
     const sessionId = payload.agent.id
+    liveAgents.set(sessionId, payload.agent)
     const state = registry.stateFor(sessionId)
     if (payload.step <= 1 || !state.enabled) return next()
-    registry.setBusy(sessionId, true)
 
-    // 人类在暂停点挂上之前就按了回车，视作预放行这一步：不再挂暂停点，直接把插话并入本步。
-    const preapproved = registry.takePendingMessages(sessionId)
-    if (preapproved.length > 0) {
-      try {
-        const decision = await next()
-        if (decision.kind === 'reject') {
-          registry.requeueMessages(sessionId, preapproved)
-          return decision
-        }
-        return { ...decision, messages: [...decision.messages, ...preapproved] }
-      } catch (error) {
-        // driver 抛错同样算这一步没发出去，队列放回，绝不让消息跟着异常一起消失。
-        registry.requeueMessages(sessionId, preapproved)
-        throw error
-      }
-    }
+    // 插话还在 inbox 里等认领：先让流程走到带插话的那一步，暂停暂不生效。
+    if (pruneSteer(sessionId, payload.messages) !== undefined) return next()
+
+    // 本步已领取到用户消息，说明是插话触发的这一步，不管来源都放行。
+    if (payload.messages.length > 0) return next()
+
+    // 队列里还有等下一轮的用户消息：已经插过话，这一轮先不再停。
+    const inbox = agentFor(sessionId)?.inbox
+    if (inbox !== undefined && inbox.nextTurn.length > 0) return next()
 
     let resolvePausePoint: (message: UserMessage | undefined) => void = () => {}
     let rejectPausePoint: (reason: unknown) => void = () => {}
@@ -255,12 +299,12 @@ export function apply(ctx: Context, config: Config = {}): void {
     try {
       decision = await next()
     } catch (error) {
-      if (carried !== undefined) registry.requeueMessages(sessionId, [carried])
+      if (carried !== undefined) resteer(sessionId, carried)
       throw error
     }
     if (decision.kind === 'reject') {
-      // 这一步被 reject 时放行的插话没有送达，放回队列而不是丢掉。
-      if (carried !== undefined) registry.requeueMessages(sessionId, [carried])
+      // 这一步被 reject 时放行的插话没有送达本步，立即重新 steer，由 dsh 在下次唤醒时认领。
+      if (carried !== undefined) resteer(sessionId, carried)
       return decision
     }
     return carried === undefined ? decision : { ...decision, messages: [...decision.messages, carried] }

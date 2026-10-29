@@ -1,7 +1,7 @@
 /**
  * dsh-pause 浏览器半身：暂停控件挂在 composer 工具行右侧 conversation.input.right。
  *
- * 目标：开关开启期间在 composer 主输入框里按 Enter 即继续。有暂停点则放行并带上草稿，没有但在跑则排进下一个暂停点，没有且空闲则由主机 followup；主机发不出去时交回客户端暂存，失败内容不退回输入框。
+ * 目标：开关开启期间在 composer 主输入框里按 Enter 即继续。有暂停点则放行并带上草稿，没有暂停点则立即 steer；主机发不出去时交回客户端暂存，失败内容不退回输入框。
  * 因为 dsh 的 composer Enter 由 InputBar 私有 keymap 处理，第三方没有正式 hook 点，所以本插件用 DOM capture 在开关开启期间常驻拦截裸 Enter，阻止默认送信并改走主机裁决。
  * 控件本身在 composer 卡内渲染，因此暂停条可见且可点。capture 监听只在开关开启期间激活，关闭时不拦截任何按键。
  *

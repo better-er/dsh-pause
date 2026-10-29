@@ -22,6 +22,12 @@ class FakeCredentials extends Service {
   }
 }
 
+/** 最小 agents 服务：返回可 steer 的桩 agent，满足插话接线。 */
+class FakeAgents extends Service {
+  constructor(ctx: Context) { super(ctx, 'agents') }
+  get(id: string): { id: string; steer(): void } { return { id, steer() {} } }
+}
+
 /** 最小 webServer 服务：记录注册的 prefix 路由。 */
 class FakeWebServer extends Service {
   readonly routes: RegisteredRoute[] = []
@@ -46,6 +52,7 @@ describe('真实 cordis 接线冒烟', () => {
     const ctx = new Context()
     await ctx.plugin(FakeCredentials)
     await ctx.plugin(FakeWebServer)
+    await ctx.plugin(FakeAgents)
     await ctx.plugin(connection)
     await settle()
     await ctx.plugin(pause)

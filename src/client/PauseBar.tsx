@@ -3,7 +3,7 @@
  *
  * 目标交互：
  * - 开关按钮，本会话总开关。
- * - 开关开启期间，在 composer 主输入框按裸 Enter 一律交主机裁决：有暂停点就继续并带插话，没有但在跑就排进下一个暂停点，没有且空闲则由主机 followup，失败内容暂存而不退回输入框。
+ * - 开关开启期间，在 composer 主输入框按裸 Enter 一律交主机裁决：有暂停点就继续并带插话，没有暂停点则立即 steer，失败内容暂存而不退回输入框。
  * - 开关关闭时不拦截任何按键，完全透明。
  *
  * dsh 的 composer Enter 由 InputBar 私有 keymap 处理，第三方没有正式 hook 点，故本组件在开关开启期间对所属 composer 挂 document 级 capture-phase keydown，抢在 Lexical 之前拦截裸 Enter。
@@ -41,10 +41,6 @@ export interface PauseControlProps extends PauseBarInjected {
 interface PauseStatus {
   enabled?: boolean
   paused?: boolean
-  /** agent 是否在跑；决定没有暂停点时插话该排队还是直接 followup。 */
-  busy?: boolean
-  /** 已排队、等下一个暂停点或 idle 补发的插话条数。 */
-  pendingMessageCount?: number
 }
 
 async function fetchStatus(rpc: PauseBarInjected['rpc'], sessionId: string): Promise<PauseStatus | undefined> {
@@ -61,10 +57,8 @@ async function fetchStatus(rpc: PauseBarInjected['rpc'], sessionId: string): Pro
 /** 一次放行的结果；error 存在表示主机拒绝，暂停点未放行。 */
 interface ReleaseOutcome {
   readonly released: boolean
-  /** 主机裁决时该会话的 agent 是否在跑。 */
-  readonly busy: boolean
-  /** 主机已接住这条插话，草稿可以清空。 */
-  readonly queued: boolean
+  /** 主机已把插话送进 dsh，草稿可以清空。 */
+  readonly delivered: boolean
   readonly error?: string
 }
 
@@ -76,11 +70,11 @@ async function callRelease(
 ): Promise<ReleaseOutcome> {
   try {
     const result = await rpc.call('/dsh-pause', 'release', { sessionId, text, images })
-    if (!result.ok) return { released: false, busy: false, queued: false, error: result.error?.message ?? '放行失败' }
-    const value = result.value as { released?: boolean; busy?: boolean; queued?: boolean } | undefined
-    return { released: value?.released === true, busy: value?.busy === true, queued: value?.queued === true }
+    if (!result.ok) return { released: false, delivered: false, error: result.error?.message ?? '放行失败' }
+    const value = result.value as { released?: boolean; delivered?: boolean } | undefined
+    return { released: value?.released === true, delivered: value?.delivered === true }
   } catch (error) {
-    return { released: false, busy: false, queued: false, error: error instanceof Error ? error.message : String(error) }
+    return { released: false, delivered: false, error: error instanceof Error ? error.message : String(error) }
   }
 }
 
@@ -93,10 +87,10 @@ async function callSetEnabled(rpc: PauseBarInjected['rpc'], sessionId: string, e
 }
 
 /**
- * 把一次回车交给主机裁决：有暂停点就放行，没有但在跑就排进下一个暂停点，没有且空闲且有 agent 引用就由主机 followup。
+ * 把一次回车交给主机裁决：有暂停点就放行，没有暂停点则由主机立即 steer。
  * 按下回车时文字与图片已经离开输入框，所以任何失败都不回填，改为暂存到下次发送时优先带出。
  */
-async function releaseOrQueue(
+async function releaseInterjection(
   rpc: PauseBarInjected['rpc'],
   sessionId: string,
   draft: string,
@@ -128,7 +122,7 @@ async function releaseOrQueue(
     onError(outcome.error + '，已保留，下次发送时一并送出')
     return
   }
-  if (outcome.released || outcome.queued) {
+  if (outcome.released || outcome.delivered) {
     onDone()
     return
   }
@@ -167,7 +161,6 @@ export const PauseControl = memo(function PauseControl({
 }: PauseControlProps) {
   const [enabled, setEnabled] = useState(false)
   const [paused, setPaused] = useState(false)
-  const [pendingCount, setPendingCount] = useState(0)
   const [error, setError] = useState<string | undefined>(undefined)
   const rootRef = useRef<HTMLDivElement | null>(null)
   // composer 卡标记缺失时只报一次，避免每次按键都刷控制台。
@@ -229,7 +222,7 @@ export const PauseControl = memo(function PauseControl({
       draftRef.current = ''
       inputActions?.setDraft('')
       for (const id of ids) inputActions?.removeAttachment(id)
-      const pendingRelease = releaseOrQueue(
+      const pendingRelease = releaseInterjection(
         rpc,
         sessionId,
         sent,
@@ -267,7 +260,6 @@ export const PauseControl = memo(function PauseControl({
       if (disposed || s === undefined) return
       setEnabled(s.enabled ?? false)
       setPaused(s.paused ?? false)
-      setPendingCount(s.pendingMessageCount ?? 0)
     }
     void poll()
     timer = setInterval(() => void poll(), 400)
@@ -363,11 +355,6 @@ export const PauseControl = memo(function PauseControl({
         >
           已暂停·回车或点此继续
         </button>
-      )}
-      {pendingCount > 0 && (
-        <span style={{ color: 'var(--dsw-alias-label-secondary)', fontSize: '12px' }}>
-          {pendingCount} 条已排入下一步
-        </span>
       )}
       {error !== undefined && (
         <span style={{ color: 'var(--dsw-alias-label-error, #d9534f)', fontSize: '12px' }}>

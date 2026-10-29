@@ -6,8 +6,8 @@
  * 放行时可带补充文字，作为一条 user 消息并入本 step 的 messages，让模型在紧接着的请求里看到它。
  *
  * 暂停点只卡在请求真正发出之前，因此不打断任何在途 API 调用。
- * 人类在暂停点挂上之前按回车时，插话先排队，下一个暂停点不再等回车而是直接带头并入本步，即预放行；
- * turn 若在暂停点出现之前结束，队列由主机作为新的 followup 发出去；followup 抛错时放回队列等下一次重试，任何失败都不静默丢弃。
+ * 暂停点还没挂上时按回车发出的插话一律立即交给 agent.steer()，由 dsh 在最近一步认领；空闲时 steer 自己开新 turn。
+ * 插件不缓存插话，也不做补发。
  * driver 组装好的上下文原样放行，不插入、不删除、不改写任何模型可见的痕迹，模型无感知暂停。
  *
  * @module dsh-pause
@@ -20,12 +20,8 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 export interface PauseSessionState {
   /** 用户开关：该会话是否启用暂停。false 时所有请求直接放行。 */
   enabled: boolean
-  /** 该会话的 agent 是否在跑。idle 时暂停点不会再来，队列要当场发出去。 */
-  busy: boolean
   /** 当前挂着的暂停点，放行时若带文字则一并返回。 */
   pausePoint: PausePoint | undefined
-  /** 暂停点还没挂上时人类已按回车发出的插话，等下一个暂停点并入或 turn 结束时 followup。 */
-  pendingMessages: UserMessage[]
 }
 
 /** 一个暂停点：人类选择继续时用它放行，可携带一条已构造好的补充用户消息。 */
@@ -69,7 +65,7 @@ export function textToMessage(text: string): UserMessage | undefined {
 
 /** 会话状态在安装器里的默认初始值。 */
 export function initialSessionState(): PauseSessionState {
-  return { enabled: false, busy: false, pausePoint: undefined, pendingMessages: [] }
+  return { enabled: false, pausePoint: undefined }
 }
 
 /** 默认每会话开关。 */
@@ -107,44 +103,6 @@ export class PauseRegistry {
     return this.stateFor(sessionId).pausePoint !== undefined
   }
 
-  /** 该会话的 agent 是否在跑。 */
-  isBusy(sessionId: string): boolean {
-    return this.stateFor(sessionId).busy
-  }
-
-  /** 待插话队列长度。 */
-  pendingMessageCount(sessionId: string): number {
-    return this.stateFor(sessionId).pendingMessages.length
-  }
-
-  /** 更新 agent 的运行状态。转为 idle 时暂停点不会再挂上，由安装器负责把队列当场发出去。 */
-  setBusy(sessionId: string, busy: boolean): void {
-    const s = this.stateFor(sessionId)
-    if (s.busy === busy) return
-    this.states.set(sessionId, { ...s, busy })
-  }
-
-  /** 把一条还没送达的插话排进队列，等下一个暂停点并入，或等 turn 结束时 followup。 */
-  queueMessage(sessionId: string, message: UserMessage): void {
-    const s = this.stateFor(sessionId)
-    this.states.set(sessionId, { ...s, pendingMessages: [...s.pendingMessages, message] })
-  }
-
-  /** 取走全部待插话。 */
-  takePendingMessages(sessionId: string): UserMessage[] {
-    const s = this.stateFor(sessionId)
-    if (s.pendingMessages.length === 0) return []
-    this.states.set(sessionId, { ...s, pendingMessages: [] })
-    return s.pendingMessages
-  }
-
-  /** 把没能并入的待插话放回队首，用于该步被 reject 或补发失败的情形。 */
-  requeueMessages(sessionId: string, messages: readonly UserMessage[]): void {
-    if (messages.length === 0) return
-    const s = this.stateFor(sessionId)
-    this.states.set(sessionId, { ...s, pendingMessages: [...messages, ...s.pendingMessages] })
-  }
-
   /**
    * 放行暂停点。若该会话当前正挂着暂停点，用给定补充消息放行并返回 true；否则返回 false。
    * 放行后状态复位为未暂停，因为这一步已经放行。
@@ -161,10 +119,8 @@ export class PauseRegistry {
   /** 挂起一个暂停点，并把放行入口写入状态。 */
   armPausePoint(sessionId: string, resolvers: Pick<PausePoint, 'resolve' | 'reject'>): void {
     const s = this.stateFor(sessionId)
-    // pre-step 一定发生在 running 内，插件热加载可能错过 idle→running 推送，这里顺手补上。
     this.states.set(sessionId, {
       ...s,
-      busy: true,
       pausePoint: { resolve: resolvers.resolve, reject: resolvers.reject },
     })
   }
