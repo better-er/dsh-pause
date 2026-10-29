@@ -82,6 +82,7 @@ dsh 把一次模型请求当作一个 step，agent 连续调用工具时会经�
 
 - 暂停点设在请求真正发出之前，故无在途调用可打断。
 - 续跑判定用同一 turn 内 step 大于 1 近似，每个 turn 的第一次请求永不暂停。
+- 已有插话时不拦：本步已领取的批次带用户消息、插话还在 inbox 等认领、下一轮队列已有消息，任一条成立就跳过这次暂停点。
 - 浏览器端经 `conversation.input.right` 槽位在 composer 工具行渲染控件。
 - 带图插话由浏览器把草稿图片序列化成 base64 随放行请求上传，主机经 `attachments.admitPromptContent` 换成持久引用后与文字并入同一条 user 消息；RPC 请求体上限据此放宽到 300 MiB。
 - 因 dsh 的 composer Enter 由 InputBar 私有 keymap 处理、第三方无 hook 点，开关开启期间用 DOM capture 常驻拦截裸 Enter，改走主机裁决，不改 DSH 源码。
