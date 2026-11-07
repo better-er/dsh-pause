@@ -214,6 +214,8 @@ export const PauseControl = memo(function PauseControl({
   const forceContinueRef = useRef<() => void>(() => {})
   // 提示的自动消失定时器。
   const hintTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  // 键盘 Pause 键切换开关，常驻监听要读最新的开关处理函数。
+  const toggleRef = useRef<() => void>(() => {})
   // 放行中的重复 Enter 记到 deferred，不并发上传，但这次回车不能丢。
   const releasingRef = useRef(false)
   const deferredRef = useRef(false)
@@ -393,6 +395,19 @@ export const PauseControl = memo(function PauseControl({
     setEnabled(next)
     await callSetEnabled(rpc, sessionId, next)
   }
+  toggleRef.current = () => { void toggle(!enabled) }
+
+  // Pause 键常驻可用，开关关闭时也能按它重新开启，所以不放在只随开关挂载的 Enter 监听里。
+  useEffect(() => {
+    const onPauseKey = (event: KeyboardEvent): void => {
+      if (event.key !== 'Pause' && event.code !== 'Pause') return
+      event.preventDefault()
+      event.stopPropagation()
+      toggleRef.current()
+    }
+    document.addEventListener('keydown', onPauseKey, true)
+    return () => document.removeEventListener('keydown', onPauseKey, true)
+  }, [])
 
   return (
     <div
