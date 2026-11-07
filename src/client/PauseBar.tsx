@@ -4,6 +4,7 @@
  * 目标交互：
  * - 开关按钮，本会话总开关。
  * - 开关开启期间，在 composer 主输入框按裸 Enter 一律交主机裁决：有暂停点就继续并带插话，没有暂停点则立即 steer，失败内容暂存而不退回输入框。
+ * - 模型空闲且输入框为空时连按两次 Enter 强制继续：主机 followup 一条空的运行时上下文唤醒消息，不产生用户消息，只让模型再发一次请求。
  * - 开关关闭时不拦截任何按键，完全透明。
  *
  * dsh 的 composer Enter 由 InputBar 私有 keymap 处理，第三方没有正式 hook 点，故本组件在开关开启期间对所属 composer 挂 document 级 capture-phase keydown，抢在 Lexical 之前拦截裸 Enter。
@@ -36,6 +37,9 @@ export interface PauseControlProps extends PauseBarInjected {
   /** 会话输入动作，用于清空草稿。 */
   inputActions: InputActions
 }
+
+/** 两次空回车之间允许的最大间隔，超过就算两次独立按键。 */
+const DOUBLE_ENTER_MS = 600
 
 /** 主机端返回的会话状态。 */
 interface PauseStatus {
@@ -75,6 +79,24 @@ async function callRelease(
     return { released: value?.released === true, delivered: value?.delivered === true }
   } catch (error) {
     return { released: false, delivered: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/** 一次强制继续的结果；started 为 false 时 reason 可能是 busy。 */
+interface ContinueOutcome {
+  readonly started: boolean
+  readonly reason?: string
+  readonly error?: string
+}
+
+async function callContinue(rpc: PauseBarInjected['rpc'], sessionId: string): Promise<ContinueOutcome> {
+  try {
+    const result = await rpc.call('/dsh-pause', 'continue', { sessionId })
+    if (!result.ok) return { started: false, error: result.error?.message ?? '强制继续失败' }
+    const value = result.value as { started?: boolean; reason?: string } | undefined
+    return { started: value?.started === true, reason: value?.reason }
+  } catch (error) {
+    return { started: false, error: error instanceof Error ? error.message : String(error) }
   }
 }
 
@@ -162,6 +184,8 @@ export const PauseControl = memo(function PauseControl({
   const [enabled, setEnabled] = useState(false)
   const [paused, setPaused] = useState(false)
   const [error, setError] = useState<string | undefined>(undefined)
+  // 第一次空回车后的提示，告诉用户再按一次即可强制继续。
+  const [hint, setHint] = useState<string | undefined>(undefined)
   const rootRef = useRef<HTMLDivElement | null>(null)
   // composer 卡标记缺失时只报一次，避免每次按键都刷控制台。
   const missingCardWarnedRef = useRef(false)
@@ -180,6 +204,16 @@ export const PauseControl = memo(function PauseControl({
   phaseRef.current = phase
   // capture 处理器要读最新的放行入口，用 ref 规避闭包过期。
   const pausePointRef = useRef<{ release: () => void }>({ release: () => {} })
+  // 暂停中不触发强制继续，capture 要读最新的暂停状态。
+  const pausedRef = useRef(false)
+  pausedRef.current = paused
+  // 上一次空回车的时间，用于识别连按两次。
+  const lastEmptyEnterRef = useRef(0)
+  // 强制继续请求在飞时忽略重复触发。
+  const forcingRef = useRef(false)
+  const forceContinueRef = useRef<() => void>(() => {})
+  // 提示的自动消失定时器。
+  const hintTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   // 放行中的重复 Enter 记到 deferred，不并发上传，但这次回车不能丢。
   const releasingRef = useRef(false)
   const deferredRef = useRef(false)
@@ -251,6 +285,18 @@ export const PauseControl = memo(function PauseControl({
     },
   }
 
+  forceContinueRef.current = () => {
+    if (forcingRef.current) return
+    forcingRef.current = true
+    setError(undefined)
+    void callContinue(rpc, sessionId)
+      .then((outcome) => {
+        if (outcome.error !== undefined) setError(outcome.error)
+        else if (!outcome.started) setError(outcome.reason === 'busy' ? '模型正在运行，等它停下来再连按两次回车' : '没能让模型继续')
+      })
+      .finally(() => { forcingRef.current = false })
+  }
+
   // 轮询主机端状态。
   useEffect(() => {
     let disposed = false
@@ -272,6 +318,22 @@ export const PauseControl = memo(function PauseControl({
   // 开关开启期间常驻 capture：暂停点挂上与否由主机裁决，客户端状态滞后不影响拦截。
   useEffect(() => {
     if (!enabled) return
+    // 提示只在两次回车之间短暂出现，第二次按下或超时都会清掉。
+    const clearHint = (): void => {
+      if (hintTimerRef.current !== undefined) {
+        clearTimeout(hintTimerRef.current)
+        hintTimerRef.current = undefined
+      }
+      setHint(undefined)
+    }
+    const showHint = (): void => {
+      clearHint()
+      setHint('再按一次强制继续')
+      hintTimerRef.current = setTimeout(() => {
+        hintTimerRef.current = undefined
+        setHint(undefined)
+      }, DOUBLE_ENTER_MS)
+    }
     const onCapture = (event: KeyboardEvent): void => {
       if (event.key !== 'Enter' || event.shiftKey || event.ctrlKey || event.metaKey) return
       if (event.isComposing || event.keyCode === 229) return
@@ -289,10 +351,41 @@ export const PauseControl = memo(function PauseControl({
       if (!card.contains(event.target as Node)) return
       event.preventDefault()
       event.stopPropagation()
-      void pausePointRef.current.release()
+      // 暂停中回车只负责放行暂停点，不参与强制继续。
+      if (pausedRef.current) {
+        lastEmptyEnterRef.current = 0
+        clearHint()
+        void pausePointRef.current.release()
+        return
+      }
+      // 只有空输入框才参与连按，带字或带图仍走原来的插话路径。
+      const empty = draftRef.current.trim() === '' && idsRef.current.length === 0
+      if (!empty) {
+        lastEmptyEnterRef.current = 0
+        clearHint()
+        void pausePointRef.current.release()
+        return
+      }
+      const now = Date.now()
+      if (now - lastEmptyEnterRef.current > DOUBLE_ENTER_MS) {
+        lastEmptyEnterRef.current = now
+        showHint()
+        void pausePointRef.current.release()
+        return
+      }
+      lastEmptyEnterRef.current = 0
+      clearHint()
+      forceContinueRef.current()
     }
     document.addEventListener('keydown', onCapture, true)
-    return () => document.removeEventListener('keydown', onCapture, true)
+    return () => {
+      if (hintTimerRef.current !== undefined) {
+        clearTimeout(hintTimerRef.current)
+        hintTimerRef.current = undefined
+      }
+      setHint(undefined)
+      document.removeEventListener('keydown', onCapture, true)
+    }
   }, [enabled, sessionId])
 
   const toggle = async (next: boolean): Promise<void> => {
@@ -355,6 +448,11 @@ export const PauseControl = memo(function PauseControl({
         >
           已暂停·回车或点此继续
         </button>
+      )}
+      {hint !== undefined && (
+        <span style={{ color: 'var(--dsw-alias-label-secondary)', fontSize: '12px' }}>
+          {hint}
+        </span>
       )}
       {error !== undefined && (
         <span style={{ color: 'var(--dsw-alias-label-error, #d9534f)', fontSize: '12px' }}>

@@ -8,6 +8,7 @@
  * 暂停点只卡在请求真正发出之前，因此不打断任何在途 API 调用。
  * 暂停点还没挂上时按回车发出的插话一律立即交给 agent.steer()，由 dsh 在最近一步认领；空闲时 steer 自己开新 turn。
  * 插件不缓存插话，也不做补发；只有该步被 reject 时把已并入的消息重新 steer 一次，失败写日志。
+ * 模型空闲时可以强制继续：followup 一条空的运行时上下文唤醒消息，loop 会把它换成自己的运行时上下文快照，会话里不会出现用户消息，模型请求仍照常发出。
  * 已经插过话时不再拦这一步：本步已领取批次带用户消息、插话还在 inbox、或下一轮队列已有消息，都直接放行。
  * driver 组装好的上下文原样放行，不插入、不删除、不改写任何模型可见的痕迹，模型无感知暂停。
  *
@@ -18,7 +19,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { DEFAULT_ENABLED, PauseRegistry, textToMessage } from './controller.ts'
+import { createContinueMessage, DEFAULT_ENABLED, PauseRegistry, textToMessage } from './controller.ts'
 import { mountRpcChannel, type RpcChannelHandler, type RpcChannelResult } from './rpc-channel.ts'
 
 declare module '@deepseek-ai/cordis' {
@@ -47,7 +48,11 @@ type PreStepDecision = { kind: 'reject' } | { kind: 'enter'; messages: UserMessa
 
 /** agent 的插话入口：steer 在最近一步认领，空闲时自己开新 turn。inbox 用来判断插话是否还在等认领。 */
 interface AgentFace {
+  /** 生命周期状态，强制继续只在空闲时允许。 */
+  readonly status?: 'idle' | 'running'
   steer(message: UserMessage): void
+  /** 排到下一轮并唤醒 driver，强制继续用它把空的运行时上下文唤醒消息送进去。 */
+  followup(message: UserMessage): void
   readonly inbox: {
     readonly nextStep: readonly UserMessage[]
     readonly nextTurn: readonly UserMessage[]
@@ -93,6 +98,7 @@ interface AttachmentStoreFace {
 interface ReleaseBody { sessionId?: unknown; text?: unknown; images?: unknown }
 interface EnableBody { sessionId?: unknown; enabled?: unknown }
 interface StatusBody { sessionId?: unknown }
+interface ContinueBody { sessionId?: unknown }
 
 function ok(value: unknown): RpcChannelResult { return { ok: true, value } }
 function rpcError(message: string): RpcChannelResult {
@@ -243,6 +249,16 @@ export function apply(ctx: Context, config: Config = {}): void {
           markSteer(sessionId, message)
           return ok({ released: false, delivered: true })
         }
+        case 'continue': {
+          const { sessionId } = payload as ContinueBody
+          if (typeof sessionId !== 'string') return rpcError('continue requires sessionId:string')
+          const agent = agentFor(sessionId)
+          if (agent === undefined) return rpcError('找不到活 agent，无法强制继续')
+          // 只在空闲时放行：模型正在运行时排队重发会打乱正在进行的这一步。
+          if (agent.status !== undefined && agent.status !== 'idle') return ok({ started: false, reason: 'busy' })
+          agent.followup(createContinueMessage())
+          return ok({ started: true })
+        }
         case 'status': {
           const { sessionId } = payload as StatusBody
           if (typeof sessionId !== 'string') return rpcError('status requires sessionId:string')
@@ -312,5 +328,5 @@ export function apply(ctx: Context, config: Config = {}): void {
 }
 
 export { PauseRegistry } from './controller.ts'
-export { shouldPause, textToMessage, initialSessionState, DEFAULT_ENABLED } from './controller.ts'
+export { shouldPause, textToMessage, createContinueMessage, initialSessionState, DEFAULT_ENABLED } from './controller.ts'
 export type { PauseSessionState, PausePoint } from './controller.ts'

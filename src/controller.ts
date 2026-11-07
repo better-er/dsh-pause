@@ -8,13 +8,23 @@
  * 暂停点只卡在请求真正发出之前，因此不打断任何在途 API 调用。
  * 暂停点还没挂上时按回车发出的插话一律立即交给 agent.steer()，由 dsh 在最近一步认领；空闲时 steer 自己开新 turn。
  * 插件不缓存插话，也不做补发。
+ * 模型空闲时可以强制继续：followup 一条空的运行时上下文唤醒消息，loop 会把它换成自己的运行时上下文快照，因此会话里不出现用户消息，请求仍会发出。
  * driver 组装好的上下文原样放行，不插入、不删除、不改写任何模型可见的痕迹，模型无感知暂停。
  *
  * @module dsh-pause
  */
 
-import type { UserMessage } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed, UserMessage } from '@deepseek-ai/dsh-llm'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    // 复用 loop 自带的运行时上下文来源，持久化目录只认已注册的 kind。
+    'runtime-context': {
+      kind: 'runtime-context'
+    } & ContextFormed
+  }
+}
 
 /** 一个会话的暂停开关与暂停点状态。会话以 agent 的 session id 为键。 */
 export interface PauseSessionState {
@@ -61,6 +71,16 @@ export function textToMessage(text: string): UserMessage | undefined {
     content: [{ type: 'text', text: trimmed }],
     source: { kind: 'user' },
   })
+}
+
+/**
+ * 构造一次「强制继续」的唤醒消息：内容为空，来源为运行时上下文。
+ *
+ * loop 进入 step 时会把来源为该 kind 的消息替换成它自己的运行时上下文快照，因此这条消息本身不会落进会话，会话里也不会出现用户消息；模型请求仍照常发出，相当于让模型对着现有上下文再答一次。
+ * @returns 待 followup 的唤醒消息。
+ */
+export function createContinueMessage(): UserMessage {
+  return createUserMessage({ content: [], source: { kind: 'runtime-context' } })
 }
 
 /** 会话状态在安装器里的默认初始值。 */
