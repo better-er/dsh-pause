@@ -66,6 +66,8 @@ function harness(enabledDefault = false, withAgents = true, withAgentPayload = t
   }
   const attachments = fakeAttachments()
   const steered: { sessionId: string; message: any }[] = []
+  const followups: { sessionId: string; message: any }[] = []
+  const statuses = new Map<string, 'idle' | 'running'>()
   let steerThrows = false
   const inboxes = new Map<string, { nextStep: any[]; nextTurn: any[] }>()
   const inboxOf = (id: string) => {
@@ -84,10 +86,15 @@ function harness(enabledDefault = false, withAgents = true, withAgentPayload = t
   const agentOf = (id: string) => ({
     id,
     inbox: inboxOf(id),
+    get status(): 'idle' | 'running' { return statuses.get(id) ?? 'idle' },
     steer(message: any) {
       if (steerThrows) throw new Error('steer failed')
       steered.push({ sessionId: id, message })
       inboxOf(id).nextStep.push(message)
+    },
+    followup(message: any) {
+      followups.push({ sessionId: id, message })
+      inboxOf(id).nextTurn.push(message)
     },
   })
   const agents = { get: (sessionId: string) => agentOf(sessionId) }
@@ -115,6 +122,8 @@ function harness(enabledDefault = false, withAgents = true, withAgentPayload = t
     discard(sessionId: string, message: any) { takeFromInbox(sessionId, message) },
     enqueueTurn(sessionId: string, message: any) { inboxOf(sessionId).nextTurn.push(message) },
     steered,
+    followups,
+    setStatus(sessionId: string, status: 'idle' | 'running') { statuses.set(sessionId, status) },
     setSteerThrows(value: boolean) { steerThrows = value },
     attachments,
   }
@@ -225,6 +234,38 @@ describe('apply host wiring', () => {
     // 收尾：关闭开关放行，避免测试留下悬挂的 Promise。
     await rpc('setEnabled', { sessionId: 's5', enabled: false })
     await p
+  })
+
+  it('空闲时强制继续：followup 一条空的运行时上下文消息', async () => {
+    const h = harness(true)
+    const res = await rpc('continue', { sessionId: 's30' })
+    expect(res.value).toEqual({ started: true })
+    expect(h.followups).toHaveLength(1)
+    const message = h.followups[0]!.message
+    expect(message.content).toEqual([])
+    expect(message.source).toMatchObject({ kind: 'runtime-context' })
+    // 唤醒消息进入下一步时直接放行，不挂暂停点，也不被当成用户消息。
+    let calledNext = false
+    const decision = await h.preStep(
+      { agent: { id: 's30' }, turn: 1, step: 2, signal: new AbortController().signal, messages: [message] },
+      async () => { calledNext = true; return { kind: 'enter', messages: [message] } },
+    )
+    expect(calledNext).toBe(true)
+    expect(decision).toEqual({ kind: 'enter', messages: [message] })
+  })
+
+  it('模型运行时强制继续返回 busy 且不 followup', async () => {
+    const h = harness(true)
+    h.setStatus('s31', 'running')
+    const res = await rpc('continue', { sessionId: 's31' })
+    expect(res.value).toEqual({ started: false, reason: 'busy' })
+    expect(h.followups).toHaveLength(0)
+  })
+
+  it('没有活 agent 时强制继续返回错误', async () => {
+    harness(true, false)
+    const res = await rpc('continue', { sessionId: 's32' })
+    expect(res.ok).toBe(false)
   })
 
   it('没有暂停点时空回车不 steer', async () => {

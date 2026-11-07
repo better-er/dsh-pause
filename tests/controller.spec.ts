@@ -3,6 +3,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import {
+  createContinueMessage,
   DEFAULT_ENABLED,
   PauseRegistry,
   initialSessionState,
@@ -31,6 +32,15 @@ describe('textToMessage', () => {
   it('非空文字产生一条 user 文本消息', () => {
     const msg = textToMessage('先别动手，我再想想')
     expect(msg?.content).toMatchObject([{ type: 'text', text: '先别动手，我再想想' }])
+  })
+})
+
+describe('createContinueMessage', () => {
+  it('产生一条内容为空的运行时上下文消息，不冒充用户', () => {
+    const msg = createContinueMessage()
+    expect(msg.content).toEqual([])
+    expect(msg.source).toMatchObject({ kind: 'runtime-context' })
+    expect(msg.role).toBe('user')
   })
 })
 
